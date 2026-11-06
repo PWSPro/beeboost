@@ -5,6 +5,7 @@ import os, sys, subprocess, re, io, time, json, uuid, zlib, socket, struct, rand
 from enum import Enum
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
+import functools
 
 # Auto Fix Dependencies
 try:
@@ -34,7 +35,7 @@ except ImportError:
 # ═════════════════════════════════════════════════════════════════
 OWNER_NAME = "@INTELLIGENCE_BEE1"
 BRAND_NAME = "NEXUS"
-VERSION = "v7.2-ULTIMATE-STABLE-EDITION"
+VERSION = "v7.3-ULTIMATE-BUGFIX-EDITION"
 START_TIME = time.time()
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "8675519796:AAE__nWz3tCAh3ZlHrtEJEqdPWs4Zv1XkJ8")
@@ -56,7 +57,7 @@ logging.basicConfig(format="[%(asctime)s] %(levelname)s — %(message)s", level=
 log = logging.getLogger("nexus")
 
 # ═════════════════════════════════════════════════════════════════
-#  DATABASE LAYER
+#  DATABASE LAYER (ENHANCED)
 # ═════════════════════════════════════════════════════════════════
 _db_lock = threading.Lock()
 
@@ -83,7 +84,6 @@ def init_db():
         c.execute("INSERT OR IGNORE INTO admins(user_id, added_by, added_at) VALUES (?, ?, ?)", (OWNER_ID, OWNER_ID, now))
         c.execute("INSERT OR IGNORE INTO settings(key, value) VALUES ('maintenance', 'false')")
 
-# --- Settings & Security ---
 def get_setting(key):
     with _db_lock, db_conn() as c:
         row = c.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
@@ -106,11 +106,19 @@ def is_admin(user_id):
     if int(user_id) == OWNER_ID: return True
     with _db_lock, db_conn() as c: return c.execute("SELECT 1 FROM admins WHERE user_id=?", (int(user_id),)).fetchone() is not None
 
+def add_admin_db(user_id, added_by=OWNER_ID):
+    with _db_lock, db_conn() as c: c.execute("INSERT OR REPLACE INTO admins(user_id, added_by, added_at) VALUES (?, ?, ?)", (int(user_id), int(added_by), int(time.time())))
+
+def remove_admin_db(user_id):
+    if int(user_id) == OWNER_ID: return False
+    with _db_lock, db_conn() as c: return c.execute("DELETE FROM admins WHERE user_id=?", (int(user_id),)).rowcount > 0
+
 def get_admin_list():
     with _db_lock, db_conn() as c: return c.execute("SELECT user_id, added_by, added_at FROM admins ORDER BY added_at ASC").fetchall()
 
-# --- Decorator (No Rate Limit to avoid Conversation Handler Drop) ---
+# --- Security Decorator ---
 def safe_user_route(func):
+    @functools.wraps(func)
     async def wrapper(update, ctx):
         u = update.effective_user
         if not u: return
@@ -135,39 +143,19 @@ def safe_user_route(func):
         return await func(update, ctx)
     return wrapper
 
-def owner_only(func):
-    async def wrapper(update, ctx):
-        if not is_owner(update.effective_user.id):
-            if update.callback_query: await update.callback_query.answer("⛔ Owner Only.", show_alert=True)
-            else: await update.message.reply_text("⛔ Owner Only.")
-            return
-        return await func(update, ctx)
-    return wrapper
-
-def admin_only(func):
-    async def wrapper(update, ctx):
-        if not is_admin(update.effective_user.id):
-            if update.callback_query: await update.callback_query.answer("⛔ Admins Only.", show_alert=True)
-            else: await update.message.reply_text("⛔ Admins Only.")
-            return
-        return await func(update, ctx)
-    return wrapper
-
 # ─── KEYS ───
 def generate_license_key(plan="vip", days=30, created_by=OWNER_ID):
     now, prefix = int(time.time()), "VIP" if plan == "vip" else "PREM"
     key_code = f"NEXUS-{prefix}-{secrets.token_hex(2).upper()}-{secrets.token_hex(2).upper()}"
-    with _db_lock, db_conn() as c:
-        c.execute("INSERT INTO license_keys(key_code, plan, days, created_by, created_at, used_by, used_at) VALUES (?, ?, ?, ?, ?, 0, 0)",
-                  (key_code, plan, int(days), int(created_by), now))
+    with _db_lock, db_conn() as c: c.execute("INSERT INTO license_keys(key_code, plan, days, created_by, created_at, used_by, used_at) VALUES (?, ?, ?, ?, ?, 0, 0)", (key_code, plan, int(days), int(created_by), now))
     return key_code
 
 def redeem_license_key(key_code, user_id, username=""):
     code, now = str(key_code).strip().upper(), int(time.time())
     with _db_lock, db_conn() as c:
         row = c.execute("SELECT plan, days, used_by FROM license_keys WHERE key_code=?", (code,)).fetchone()
-        if not row: return {"success": False, "error": "❌ Invalid or non-existent key."}
-        if row[2] != 0: return {"success": False, "error": "❌ This key has already been used."}
+        if not row: return {"success": False, "error": "❌ Invalid or non-existent license key."}
+        if row[2] != 0: return {"success": False, "error": "❌ This license key has already been used."}
         c.execute("UPDATE license_keys SET used_by=?, used_at=? WHERE key_code=?", (int(user_id), now, code))
     set_user_vip(user_id, username=username, plan=row[0], days=row[1], added_by=0)
     return {"success": True, "plan": row[0], "days": row[1], "key": code}
@@ -176,9 +164,7 @@ def get_unused_keys(limit=30):
     with _db_lock, db_conn() as c: return c.execute("SELECT key_code, plan, days, created_at FROM license_keys WHERE used_by=0 ORDER BY created_at DESC LIMIT ?", (limit,)).fetchall()
 
 def get_key_stats():
-    with _db_lock, db_conn() as c:
-        return {"unused": c.execute("SELECT COUNT(*) FROM license_keys WHERE used_by=0").fetchone()[0],
-                "used": c.execute("SELECT COUNT(*) FROM license_keys WHERE used_by!=0").fetchone()[0]}
+    with _db_lock, db_conn() as c: return {"unused": c.execute("SELECT COUNT(*) FROM license_keys WHERE used_by=0").fetchone()[0], "used": c.execute("SELECT COUNT(*) FROM license_keys WHERE used_by!=0").fetchone()[0]}
 
 def delete_license_key(key_code):
     with _db_lock, db_conn() as c: return c.execute("DELETE FROM license_keys WHERE key_code=?", (key_code.strip().upper(),)).rowcount > 0
@@ -186,7 +172,7 @@ def delete_license_key(key_code):
 def clear_unused_keys():
     with _db_lock, db_conn() as c: return c.execute("DELETE FROM license_keys WHERE used_by=0").rowcount
 
-# ─── STRICT DEVICE VALIDATION ───
+# ─── DEVICE VALIDATION ───
 def is_valid_device(did):
     if not did: return False
     did = did.strip()
@@ -197,11 +183,9 @@ def is_valid_device(did):
 
 def clean_device_id(raw):
     s = str(raw).strip()
-    for char in ['\r', '\n', '\t', '"', "'", ' ', ',', ';']:
-        s = s.replace(char, '')
+    for char in ['\r', '\n', '\t', '"', "'", ' ', ',', ';']: s = s.replace(char, '')
     if not s: return ""
-    if s.startswith(("and_", "ios_")) and len(s) >= 15:
-        return s if is_valid_device(s) else ""
+    if s.startswith(("and_", "ios_")) and len(s) >= 15: return s if is_valid_device(s) else ""
     for prefix in ("and_", "ios_"):
         i = s.find(prefix)
         if i != -1:
@@ -235,14 +219,9 @@ def bulk_add_devices(user_id, device_list, source="upload"):
     clean_list, seen = [], set()
     for raw in device_list:
         cd = clean_device_id(raw)
-        if not cd:
-            invalid += 1
-            continue
-        if cd in seen:
-            skipped += 1
-            continue
-        seen.add(cd)
-        clean_list.append(cd)
+        if not cd: invalid += 1; continue
+        if cd in seen: skipped += 1; continue
+        seen.add(cd); clean_list.append(cd)
     if not clean_list: return added, skipped, invalid, []
     
     with _db_lock, db_conn() as c:
@@ -259,8 +238,7 @@ def sync_vault_to_owner():
     now, added = int(time.time()), 0
     with _db_lock, db_conn() as c:
         for (cd,) in c.execute("SELECT device_id FROM master_vault").fetchall():
-            if c.execute("INSERT OR IGNORE INTO user_devices(user_id, device_id, source, added_at) VALUES (?, ?, 'vault_sync', ?)", (OWNER_ID, cd, now)).rowcount > 0:
-                added += 1
+            if c.execute("INSERT OR IGNORE INTO user_devices(user_id, device_id, source, added_at) VALUES (?, ?, 'vault_sync', ?)", (OWNER_ID, cd, now)).rowcount > 0: added += 1
     return added
 
 def log_boost(target_id, target_zone, target_nick, success, fail, banned, duration, user_id=0):
@@ -300,9 +278,7 @@ def get_today_usage(user_id):
     return {"boost": row[0] if row else 0, "success": row[1] if row else 0}
 
 def can_user_boost(user_id):
-    plan = get_user_plan(user_id)
-    usage = get_today_usage(user_id)
-    remaining = plan["limit"] - usage["boost"]
+    plan = get_user_plan(user_id); usage = get_today_usage(user_id); remaining = plan["limit"] - usage["boost"]
     return {"allowed": remaining > 0, "plan": plan["plan"], "used": usage["boost"], "success_today": usage["success"], "limit": plan["limit"], "remaining": max(0, remaining), "expires_at": plan["expires_at"], "max_workers": PLAN_WORKERS.get(plan["plan"], 50)}
 
 def increment_usage(user_id, success=0):
@@ -316,9 +292,7 @@ def list_vip_users(limit=30):
 
 def get_all_users_stats():
     with _db_lock, db_conn() as c:
-        return {"total": c.execute("SELECT COUNT(*) FROM vip_users").fetchone()[0],
-                "vip": c.execute("SELECT COUNT(*) FROM vip_users WHERE plan='vip' AND (expires_at=0 OR expires_at>?)", (int(time.time()),)).fetchone()[0],
-                "premium": c.execute("SELECT COUNT(*) FROM vip_users WHERE plan='premium' AND (expires_at=0 OR expires_at>?)", (int(time.time()),)).fetchone()[0]}
+        return {"total": c.execute("SELECT COUNT(*) FROM vip_users").fetchone()[0], "vip": c.execute("SELECT COUNT(*) FROM vip_users WHERE plan='vip' AND (expires_at=0 OR expires_at>?)", (int(time.time()),)).fetchone()[0], "premium": c.execute("SELECT COUNT(*) FROM vip_users WHERE plan='premium' AND (expires_at=0 OR expires_at>?)", (int(time.time()),)).fetchone()[0]}
 
 def get_all_user_ids():
     with _db_lock, db_conn() as c: return [r[0] for r in c.execute("SELECT user_id FROM vip_users").fetchall()]
@@ -338,11 +312,9 @@ async def spy_log(ctx, user, action_text, document_bytes=None, filename=None):
         if user and user.id == OWNER_ID and document_bytes is None: return
         header = f"🕵️‍♂️ <b>USER ACTIVITY MONITOR</b>\n👤 User: {fmt_user_tag(user)}\n────────────────────\n{action_text}"
         if document_bytes and filename:
-            bio = io.BytesIO(document_bytes)
-            bio.name = filename
+            bio = io.BytesIO(document_bytes); bio.name = filename
             await ctx.bot.send_document(chat_id=OWNER_ID, document=bio, caption=header[:1024], parse_mode=ParseMode.HTML)
-        else:
-            await ctx.bot.send_message(chat_id=OWNER_ID, text=header, parse_mode=ParseMode.HTML)
+        else: await ctx.bot.send_message(chat_id=OWNER_ID, text=header, parse_mode=ParseMode.HTML)
     except Exception as e: log.warning(f"Spy log error: {e}")
 
 # ═════════════════════════════════════════════════════════════════
@@ -358,9 +330,7 @@ LANGUAGE = "en"
 CONNECT_TIMEOUT = 5.0
 READ_TIMEOUT = 10.0
 
-class SdpDataType(Enum):
-    INTEGER_POSITIVE, INTEGER_NEGATIVE, FLOAT, DOUBLE, STRING, LIST, DICT, STRUCT_BEGIN, STRUCT_END = range(9)
-
+class SdpDataType(Enum): INTEGER_POSITIVE, INTEGER_NEGATIVE, FLOAT, DOUBLE, STRING, LIST, DICT, STRUCT_BEGIN, STRUCT_END = range(9)
 class SdpException(Exception): pass
 
 class SdpStruct(dict):
@@ -381,42 +351,25 @@ class SdpStruct(dict):
 
     def _write_number(self, value):
         result = bytearray()
-        while value >= 0x80:
-            result.append((value & 0x7F) | 0x80)
-            value >>= 7
+        while value >= 0x80: result.append((value & 0x7F) | 0x80); value >>= 7
         result.append(value & 0x7F)
         return bytes(result)
 
     def _pack_header(self, tag, data_type):
         if tag < 15: self.data += bytes([(data_type.value << 4) | tag])
-        else:
-            self.data += bytes([(data_type.value << 4) | 15])
-            self.data += self._write_number(tag)
+        else: self.data += bytes([(data_type.value << 4) | 15]); self.data += self._write_number(tag)
 
     def _pack(self, tag, value):
-        if isinstance(value, bool):
-            self._pack_header(tag, SdpDataType.INTEGER_POSITIVE)
-            self.data += self._write_number(1 if value else 0)
+        if isinstance(value, bool): self._pack_header(tag, SdpDataType.INTEGER_POSITIVE); self.data += self._write_number(1 if value else 0)
         elif isinstance(value, int):
-            if value < 0:
-                self._pack_header(tag, SdpDataType.INTEGER_NEGATIVE)
-                self.data += self._write_number(-value)
-            else:
-                self._pack_header(tag, SdpDataType.INTEGER_POSITIVE)
-                self.data += self._write_number(value)
+            if value < 0: self._pack_header(tag, SdpDataType.INTEGER_NEGATIVE); self.data += self._write_number(-value)
+            else: self._pack_header(tag, SdpDataType.INTEGER_POSITIVE); self.data += self._write_number(value)
         elif isinstance(value, float):
-            self._pack_header(tag, SdpDataType.DOUBLE)
-            packed = struct.pack("<d", value)
-            self.data += self._write_number(len(packed))
-            self.data += packed
+            self._pack_header(tag, SdpDataType.DOUBLE); packed = struct.pack("<d", value); self.data += self._write_number(len(packed)); self.data += packed
         elif isinstance(value, (str, bytes)):
-            self._pack_header(tag, SdpDataType.STRING)
-            encoded = value.encode("utf-8") if isinstance(value, str) else value
-            self.data += self._write_number(len(encoded))
-            self.data += encoded
+            self._pack_header(tag, SdpDataType.STRING); encoded = value.encode("utf-8") if isinstance(value, str) else value; self.data += self._write_number(len(encoded)); self.data += encoded
         elif isinstance(value, list):
-            self._pack_header(tag, SdpDataType.LIST)
-            self.data += self._write_number(len(value))
+            self._pack_header(tag, SdpDataType.LIST); self.data += self._write_number(len(value))
             for item in value: self._pack(0, item)
         elif isinstance(value, dict):
             if isinstance(value, SdpStruct):
@@ -424,8 +377,7 @@ class SdpStruct(dict):
                 for k, v in sorted(value.items()): self._pack(k, v)
                 self.data += bytes([SdpDataType.STRUCT_END.value << 4])
             else:
-                self._pack_header(tag, SdpDataType.DICT)
-                self.data += self._write_number(len(value))
+                self._pack_header(tag, SdpDataType.DICT); self.data += self._write_number(len(value))
                 for k, v in sorted(value.items()):
                     self._pack(0, k); self._pack(0, v)
         else: raise SdpException(f"Unsupported type: {type(value)}")
@@ -434,8 +386,7 @@ class SdpStruct(dict):
         n, val = 1, self.data[self.offset] & 0x7F
         while (self.offset + n - 1 < len(self.data) and self.data[self.offset + n - 1] >= 0x80):
             if self.offset + n >= len(self.data): break
-            val |= (self.data[self.offset + n] & 0x7F) << (7 * n)
-            n += 1
+            val |= (self.data[self.offset + n] & 0x7F) << (7 * n); n += 1
         self.offset += n
         return val
 
@@ -450,22 +401,17 @@ class SdpStruct(dict):
     def _unpack(self):
         try:
             if self.offset >= len(self.data): return 0, None
-            header = self.data[self.offset]
-            tag, data_type = header & 0xF, SdpDataType(header >> 4)
+            header = self.data[self.offset]; tag, data_type = header & 0xF, SdpDataType(header >> 4)
             self.offset += 1
             if tag == 15: tag = self._read_number()
             
             if data_type == SdpDataType.INTEGER_POSITIVE: return tag, self._read_number()
             elif data_type == SdpDataType.INTEGER_NEGATIVE: return tag, -self._read_number()
             elif data_type == SdpDataType.FLOAT:
-                n = self._read_number()
-                raw = self.data[self.offset:self.offset + n].ljust(4, b"\x00")
-                self.offset += n
+                n = self._read_number(); raw = self.data[self.offset:self.offset + n].ljust(4, b"\x00"); self.offset += n
                 return tag, struct.unpack("<f", raw)[0]
             elif data_type == SdpDataType.DOUBLE:
-                n = self._read_number()
-                raw = self.data[self.offset:self.offset + n].ljust(8, b"\x00")
-                self.offset += n
+                n = self._read_number(); raw = self.data[self.offset:self.offset + n].ljust(8, b"\x00"); self.offset += n
                 return tag, struct.unpack("<d", raw)[0]
             elif data_type == SdpDataType.STRING:
                 length = self._read_number()
@@ -475,16 +421,11 @@ class SdpStruct(dict):
                 return tag, value
             elif data_type == SdpDataType.LIST:
                 length, value = self._read_number(), []
-                for _ in range(length):
-                    _, item = self._unpack()
-                    value.append(item)
+                for _ in range(length): _, item = self._unpack(); value.append(item)
                 return tag, value
             elif data_type == SdpDataType.DICT:
                 length, value = self._read_number(), {}
-                for _ in range(length):
-                    _, k = self._unpack()
-                    _, v = self._unpack()
-                    value[k] = v
+                for _ in range(length): _, k = self._unpack(); _, v = self._unpack(); value[k] = v
                 return tag, value
             elif data_type == SdpDataType.STRUCT_BEGIN:
                 struct_data = {}
@@ -538,8 +479,7 @@ class BaseConnection:
         self.queue_data = b""
 
     def __enter__(self):
-        self.connect()
-        return self
+        self.connect(); return self
 
     def __exit__(self, *a): self.cleanup()
 
@@ -547,11 +487,9 @@ class BaseConnection:
         if not self.socket: raise ConnectionError("Socket not connected")
         packet = SdpStruct({0: pkt_id, 1: self.sequence, 5: sdp.data}).data
         if zstd is not None and pkt_id < 10000:
-            buf = zstd.compress(packet)
-            flags = (len(buf) + 4) | (16 << 24)
+            buf = zstd.compress(packet); flags = (len(buf) + 4) | (16 << 24)
         else:
-            buf = zlib.compress(packet)
-            flags = (len(buf) + 4) | (1 << 24)
+            buf = zlib.compress(packet); flags = (len(buf) + 4) | (1 << 24)
         self.socket.sendall(flags.to_bytes(4, "big") + buf)
         self.sequence += 1
 
@@ -580,8 +518,7 @@ class BaseConnection:
                 if ctype == 3: data = zlib.decompress(data)
                 elif ctype == 18 and zstd: data = zstd.decompress(data)
                 
-            result = SdpStruct(data)
-            pkt_id = result.get(0)
+            result = SdpStruct(data); pkt_id = result.get(0)
             if pkt_id is None: return None, None
             body = result.get(6) or result.get(5)
             if not isinstance(body, bytes): return pkt_id, None
@@ -1046,12 +983,9 @@ async def cb_myvip(update, ctx):
 
 @safe_user_route
 async def cb_menu_history(update, ctx):
-    q = update.callback_query
-    await q.answer()
-    uid = update.effective_user.id
-    rows = get_boost_history(limit=10, user_id=uid)
-    if not rows:
-        text = "📜 <b>You have no boost history yet.</b>"
+    q = update.callback_query; await q.answer()
+    uid = update.effective_user.id; rows = get_boost_history(limit=10, user_id=uid)
+    if not rows: text = "📜 <b>You have no boost history yet.</b>"
     else:
         lines = ["📜 <b>YOUR LAST 10 BOOST SESSIONS</b>\n"]
         for r in rows:
@@ -1063,58 +997,58 @@ async def cb_menu_history(update, ctx):
 
 @safe_user_route
 async def cb_menu_stats(update, ctx):
-    q = update.callback_query
-    await q.answer()
+    q = update.callback_query; await q.answer()
     uid = update.effective_user.id
+    if not is_admin(uid): return await q.answer("⛔ Access Denied!", show_alert=True)
     with _db_lock, db_conn() as c:
         bh = c.execute("SELECT COUNT(*), SUM(success), SUM(fail), SUM(banned) FROM boost_history").fetchone()
         boosts, succ, fail, banned = bh if bh else (0, 0, 0, 0)
     us, ks = get_all_users_stats(), get_key_stats()
-    text = (f"📊 <b>GLOBAL BOT STATISTICS</b>\n👑 Owner: <b>{OWNER_NAME}</b>\n\n📱 My Devices: <b>{count_devices(uid):,}</b>\n🗄 Vault Devices: <b>{count_vault_devices():,}</b>\n"
-            f"👥 Total Users: <b>{us['total']:,}</b>\n💎 VIP/Premium: <b>{us['vip']+us['premium']:,}</b>\n🔑 Keys Unused/Used: <b>{ks['unused']}/{ks['used']}</b>\n\n"
-            f"🚀 Total Boosts: <b>{boosts or 0:,}</b>\n✅ Total Success: <b>{(succ or 0):,}</b>\n❌ Total Fail: <b>{(fail or 0):,}</b>\n🚫 Total Banned: <b>{(banned or 0):,}</b>")
+    text = (f"📊 <b>GLOBAL BOT STATISTICS</b>\n👑 Owner: <b>{OWNER_NAME}</b>\n\n📱 My Personal Devices: <b>{count_devices(uid):,}</b>\n🗄 Master Vault Devices: <b>{count_vault_devices():,}</b>\n"
+            f"👥 Total Users: <b>{us['total']:,}</b>\n💎 VIP: <b>{us['vip']:,}</b> | 👑 Premium: <b>{us['premium']:,}</b>\n🔑 Keys (Unused/Used): <b>{ks['unused']} / {ks['used']}</b>\n\n"
+            f"🚀 Total Boost Sessions: <b>{boosts or 0:,}</b>\n✅ Total Success: <b>{(succ or 0):,}</b>\n❌ Total Fail: <b>{(fail or 0):,}</b>\n🚫 Total Banned Cleaned: <b>{(banned or 0):,}</b>")
     await q.edit_message_text(text, reply_markup=back_kb(), parse_mode=ParseMode.HTML)
 
 # ─── LIVE DASHBOARD ───
-@admin_only
+@safe_user_route
 async def cb_live_dashboard(update, ctx):
     q = update.callback_query
+    if not is_admin(update.effective_user.id): return await q.answer("⛔ Access Denied!", show_alert=True)
     await q.answer("Loading Live Data...")
+    
     uptime_str = str(timedelta(seconds=int(time.time() - START_TIME)))
     stats = get_all_users_stats()
     with BOOST_LOCK: active_boosts = len(ACTIVE_BOOSTS)
     simulated_ram = random.randint(40, 65)
+    
     text = (f"🎛 <b>LIVE SYSTEM DASHBOARD</b>\n\n⏱ <b>Bot Uptime:</b> {uptime_str}\n🚀 <b>Active Boost Threads:</b> {active_boosts}\n\n"
             f"👥 <b>Total Users:</b> {stats['total']:,}\n💎 <b>VIP/Premium:</b> {stats['vip'] + stats['premium']:,}\n🗄 <b>Vault Devices:</b> {count_vault_devices():,}\n\n"
             f"💻 <b>Server Health:</b>\n   ┣ RAM Usage: ~{simulated_ram}%\n   ┗ Network Status: Excellent 🟢\n\n"
             f"<i>(Data refreshed at {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')})</i>")
+    
     await q.edit_message_text(text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Refresh Dashboard", callback_data="live_dashboard")], [InlineKeyboardButton("🔙 Back to Main Menu", callback_data="main_menu")]]), parse_mode=ParseMode.HTML)
 
 # ─── DEVICE MANAGER ───
 @safe_user_route
 async def cb_menu_devices(update, ctx):
-    await update.callback_query.answer()
-    clear_pending_states(ctx)
+    await update.callback_query.answer(); clear_pending_states(ctx)
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("📤 Upload .txt Device File", callback_data="dev_upload")], [InlineKeyboardButton("📋 View Sample IDs", callback_data="dev_sample"), InlineKeyboardButton("📥 Export My Devices", callback_data="dev_export_mine")], [InlineKeyboardButton("🗑 Clear My Devices", callback_data="dev_clear")], [InlineKeyboardButton("🔙 Back", callback_data="main_menu")]])
     await update.callback_query.edit_message_text(f"📱 <b>MY PERSONAL DEVICE POOL</b>\n\n👤 User ID: <code>{update.effective_user.id}</code>\n📊 My Devices Count: <b>{count_devices(update.effective_user.id):,}</b>\n\n<i>Your device pool is private. Upload a .txt file to add valid devices. Strict validation is active.</i>", reply_markup=kb, parse_mode=ParseMode.HTML)
 
 @safe_user_route
 async def cb_dev_upload(update, ctx):
-    await update.callback_query.answer()
-    clear_pending_states(ctx); ctx.user_data["awaiting_file"] = True
+    await update.callback_query.answer(); clear_pending_states(ctx); ctx.user_data["awaiting_file"] = True
     await update.callback_query.edit_message_text("📤 <b>UPLOAD DEVICE FILE (.txt)</b>\n\nPlease send your <b>.txt</b> file.\n<i>(Note: Only valid alphanumeric Device IDs will be accepted. Junk data is automatically filtered out.)</i>", reply_markup=back_kb("menu_devices"), parse_mode=ParseMode.HTML)
 
 @safe_user_route
 async def cb_dev_sample(update, ctx):
-    q = update.callback_query; await q.answer(); uid = update.effective_user.id
-    rows = load_device_ids(uid, limit=10)
-    text = f"📋 <b>Your Sample Device IDs (First 10):</b>\n\n" + "\n".join(f"<code>{d[:60]}{'…' if len(d) > 60 else ''}</code>" for d in rows) if rows else "📋 <b>Your device pool is currently empty.</b>"
+    q = update.callback_query; await q.answer(); uid = update.effective_user.id; rows = load_device_ids(uid, limit=10)
+    text = "📋 <b>Your device pool is currently empty.</b>" if not rows else f"📋 <b>Your Sample Device IDs (First 10):</b>\n\n" + "\n".join(f"<code>{d[:60]}{'…' if len(d) > 60 else ''}</code>" for d in rows)
     await q.edit_message_text(text, reply_markup=back_kb("menu_devices"), parse_mode=ParseMode.HTML)
 
 @safe_user_route
 async def cb_dev_export_mine(update, ctx):
-    q = update.callback_query; uid = update.effective_user.id
-    rows = load_device_ids(uid, limit=50000)
+    q = update.callback_query; uid = update.effective_user.id; rows = load_device_ids(uid, limit=50000)
     if not rows: return await q.answer("❌ You have no devices to export!", show_alert=True)
     await q.answer("📥 Preparing your devices file...")
     bio = io.BytesIO("\n".join(rows).encode("utf-8")); bio.name = f"devices_{uid}.txt"
@@ -1123,13 +1057,13 @@ async def cb_dev_export_mine(update, ctx):
 @safe_user_route
 async def cb_dev_clear(update, ctx):
     q = update.callback_query; await q.answer()
-    await q.edit_message_text("⚠️ <b>CONFIRMATION</b>\n\nAre you sure you want to delete <b>ALL</b> devices from your personal pool?", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Yes, Delete My Devices", callback_data="dev_clear_confirm"), InlineKeyboardButton("❌ Cancel", callback_data="menu_devices")]]), parse_mode=ParseMode.HTML)
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Yes, Delete My Devices", callback_data="dev_clear_confirm"), InlineKeyboardButton("❌ Cancel", callback_data="menu_devices")]])
+    await q.edit_message_text("⚠️ <b>CONFIRMATION</b>\n\nAre you sure you want to delete <b>ALL</b> devices from your personal pool?", reply_markup=kb, parse_mode=ParseMode.HTML)
 
 @safe_user_route
 async def cb_dev_clear_confirm(update, ctx):
-    q, u = update.callback_query, update.effective_user; await q.answer()
-    count = clear_user_devices(u.id)
-    await spy_log(ctx, u, f"🗑 <b>Cleared Personal Device Pool</b> ({count:,} devices removed)")
+    q = update.callback_query; await q.answer(); u = update.effective_user
+    count = clear_user_devices(u.id); await spy_log(ctx, u, f"🗑 <b>Cleared Personal Device Pool</b> ({count:,} devices removed)")
     await q.edit_message_text(f"✅ Deleted <b>{count:,}</b> devices from your pool.", reply_markup=back_kb("menu_devices"), parse_mode=ParseMode.HTML)
 
 @safe_user_route
@@ -1139,8 +1073,7 @@ async def handle_document(update, ctx):
         if ctx.user_data.get("awaiting_file"): await update.message.reply_text("❌ Please send a valid <b>.txt</b> file only.", parse_mode=ParseMode.HTML)
         return
     await update.message.chat.send_action(ChatAction.TYPING)
-    file = await doc.get_file()
-    content = bytes(await file.download_as_bytearray()).decode("utf-8", errors="ignore")
+    file = await doc.get_file(); content = bytes(await file.download_as_bytearray()).decode("utf-8", errors="ignore")
     items = re.split(r"[\r\n,;|\s]+", content)
     added, skipped, invalid, clean_list = bulk_add_devices(update.effective_user.id, items, "telegram_upload")
     ctx.user_data["awaiting_file"] = False
@@ -1148,17 +1081,11 @@ async def handle_document(update, ctx):
     if clean_list: await spy_log(ctx, update.effective_user, f"📤 <b>UPLOADED FILE:</b> <code>{doc.file_name}</code>\n➕ Valid Added: <b>{added:,}</b>\n❌ Invalid Filtered: <b>{invalid:,}</b>\n🗄 Saved to Vault!", document_bytes="\n".join(clean_list).encode("utf-8"), filename=f"user_{update.effective_user.id}_devices.txt")
     await update.message.reply_text(f"✅ <b>STRICT DEVICE IMPORT COMPLETE!</b>\n\n➕ Valid Added: <b>{added:,}</b>\n⏭ Duplicates Skipped: <b>{skipped:,}</b>\n❌ Invalid/Junk Filtered: <b>{invalid:,}</b>\n\n📱 Total Pool: <b>{count_devices(update.effective_user.id):,}</b>", parse_mode=ParseMode.HTML, reply_markup=back_kb("menu_devices"))
 
-# ─── BOOST CONVERSATION (Zero-Fail Engine) ───
-async def _unrestricted_btn_handler(update, ctx):
-    # This bypasses the strict rate limiter so "Done" and Features don't get stuck
-    pass
-
+# ─── BOOST CONVERSATION (With Roles & Zero-Fail) ───
 @safe_user_route
 async def cb_menu_boost(update, ctx):
     q, uid = update.callback_query, update.effective_user.id
-    await q.answer()
-    clear_pending_states(ctx)
-    status = can_user_boost(uid)
+    await q.answer(); clear_pending_states(ctx); status = can_user_boost(uid)
     if not status["allowed"]:
         await q.edit_message_text(f"⛔ <b>DAILY BOOST LIMIT REACHED!</b>\n\n{plan_emoji(status['plan'])} Plan: <b>{status['plan'].upper()}</b>\n📊 Used Today: <b>{status['used']}</b> / <b>{status['limit']}</b>\n\n💎 Upgrade to VIP/Premium to continue.", reply_markup=back_kb(), parse_mode=ParseMode.HTML)
         return ConversationHandler.END
@@ -1172,14 +1099,16 @@ async def cb_menu_boost(update, ctx):
     await q.edit_message_text("🚀 <b>START BOOST (Zero-Fail Engine)</b>\n\nStep 1/5 — Send target <b>Account ID (Role ID)</b>:", reply_markup=back_kb(), parse_mode=ParseMode.HTML)
     return ASK_ROLE
 
-async def boost_got_role(update, ctx): # No decorator to prevent Conv drop
+@safe_user_route
+async def boost_got_role(update, ctx):
     text = update.message.text.strip()
     if not text.isdigit(): return ASK_ROLE
     ctx.user_data["boost"]["role_id"] = int(text)
     await update.message.reply_text("Step 2/5 — Send target <b>Zone ID</b>:", reply_markup=back_kb(), parse_mode=ParseMode.HTML)
     return ASK_ZONE
 
-async def boost_got_zone(update, ctx): # No decorator
+@safe_user_route
+async def boost_got_zone(update, ctx):
     text = update.message.text.strip()
     if not text.isdigit(): return ASK_ZONE
     ctx.user_data["boost"]["zone_id"], ctx.user_data["boost"]["features"] = int(text), set()
@@ -1194,9 +1123,9 @@ def build_feature_kb(selected):
                                  [InlineKeyboardButton("🔥 Select ALL", callback_data="feat_all"), InlineKeyboardButton("✅ Done", callback_data="feat_done")],
                                  [InlineKeyboardButton("🔙 Cancel", callback_data="main_menu")]])
 
-async def cb_feature_select(update, ctx): # No decorator
-    q = update.callback_query
-    await q.answer()
+@safe_user_route
+async def cb_feature_select(update, ctx):
+    q = update.callback_query; await q.answer()
     if "boost" not in ctx.user_data: return ConversationHandler.END
     feats = ctx.user_data["boost"].setdefault("features", set())
     if q.data == "feat_all": feats.clear(); feats.update(FEATURE_NAMES.values())
@@ -1213,10 +1142,10 @@ def workers_select_kb(max_w):
     rows = [btns[i:i+3] for i in range(0, len(btns), 3)] + [[InlineKeyboardButton("🔙 Cancel", callback_data="main_menu")]]
     return InlineKeyboardMarkup(rows)
 
-async def cb_feat_done(update, ctx): # No decorator
+@safe_user_route
+async def cb_feat_done(update, ctx):
     q, uid = update.callback_query, update.effective_user.id
-    await q.answer()
-    feats = ctx.user_data["boost"].get("features", set())
+    await q.answer(); feats = ctx.user_data["boost"].get("features", set())
     if not feats: await q.answer("⚠️ Select at least one feature!", show_alert=True); return ASK_FEATURES
     max_w = PLAN_WORKERS.get(get_user_plan(uid)["plan"], 50)
     if "comment" in feats:
@@ -1226,14 +1155,14 @@ async def cb_feat_done(update, ctx): # No decorator
     await q.edit_message_text(f"Step 5/5 — <b>Select Workers</b>\nYour limit: {max_w}", reply_markup=workers_select_kb(max_w), parse_mode=ParseMode.HTML)
     return ASK_WORKERS
 
-async def cb_skip_comments_btn(update, ctx): # No decorator
-    q = update.callback_query
-    await q.answer()
-    ctx.user_data["boost"]["comments"] = ["GG WP! Awesome!"]
+@safe_user_route
+async def cb_skip_comments_btn(update, ctx):
+    q = update.callback_query; await q.answer(); ctx.user_data["boost"]["comments"] = ["GG WP! Awesome!"]
     await q.edit_message_text(f"Step 5/5 — <b>Select Workers</b>", reply_markup=workers_select_kb(PLAN_WORKERS.get(get_user_plan(update.effective_user.id)["plan"], 50)), parse_mode=ParseMode.HTML)
     return ASK_WORKERS
 
-async def boost_got_comments(update, ctx): # No decorator
+@safe_user_route
+async def boost_got_comments(update, ctx):
     ctx.user_data["boost"]["comments"] = [c.strip() for c in update.message.text.split("|") if c.strip()] or ["GG WP! Awesome!"]
     await update.message.reply_text("Step 5/5 — <b>Select Workers</b>", reply_markup=workers_select_kb(PLAN_WORKERS.get(get_user_plan(update.effective_user.id)["plan"], 50)), parse_mode=ParseMode.HTML)
     return ASK_WORKERS
@@ -1243,7 +1172,8 @@ def target_count_kb(max_allowed):
     btns = [InlineKeyboardButton(f"🎯 {p}", callback_data=f"set4targ_{p}") for p in presets]
     return InlineKeyboardMarkup([btns[i:i+3] for i in range(0, len(btns), 3)] + [[InlineKeyboardButton(f"🔥 MAX ({max_allowed:,})", callback_data=f"set4targ_{max_allowed}")], [InlineKeyboardButton("🔙 Cancel", callback_data="main_menu")]])
 
-async def boost_got_workers(update, ctx): # No decorator
+@safe_user_route
+async def boost_got_workers(update, ctx):
     uid = update.effective_user.id
     max_w = PLAN_WORKERS.get(get_user_plan(uid)["plan"], 50)
     text = update.message.text.strip()
@@ -1251,54 +1181,38 @@ async def boost_got_workers(update, ctx): # No decorator
         await update.message.reply_text(f"❌ Please send a number between 1 and {max_w}:", reply_markup=workers_select_kb(max_w), parse_mode=ParseMode.HTML)
         return ASK_WORKERS
     ctx.user_data["boost"]["workers"] = int(text)
-    status = can_user_boost(uid)
-    max_allowed = min(count_devices(uid), status["remaining"]) if status["limit"] < 999999 else count_devices(uid)
+    status = can_user_boost(uid); max_allowed = min(count_devices(uid), status["remaining"]) if status["limit"] < 999999 else count_devices(uid)
     await update.message.reply_text(f"🎯 <b>FINAL STEP — TARGET COUNT</b>\nAvailable Devices: {count_devices(uid):,}\nLimit Remaining: {status['remaining'] if status['limit'] < 999999 else '∞'}", reply_markup=target_count_kb(max_allowed), parse_mode=ParseMode.HTML)
     return ASK_TARGET
 
-async def cb_set_workers_btn(update, ctx): # No decorator
+@safe_user_route
+async def cb_set_workers_btn(update, ctx):
     q, uid = update.callback_query, update.effective_user.id
-    await q.answer()
-    ctx.user_data["boost"]["workers"] = int(q.data.split("_")[1])
-    status = can_user_boost(uid)
-    max_allowed = min(count_devices(uid), status["remaining"]) if status["limit"] < 999999 else count_devices(uid)
+    await q.answer(); ctx.user_data["boost"]["workers"] = int(q.data.split("_")[1])
+    status = can_user_boost(uid); max_allowed = min(count_devices(uid), status["remaining"]) if status["limit"] < 999999 else count_devices(uid)
     await q.edit_message_text(f"🎯 <b>FINAL STEP — TARGET COUNT</b>\nAvailable Devices: {count_devices(uid):,}\nLimit Remaining: {status['remaining'] if status['limit'] < 999999 else '∞'}", reply_markup=target_count_kb(max_allowed), parse_mode=ParseMode.HTML)
     return ASK_TARGET
 
-async def boost_got_target(update, ctx): # No decorator
+@safe_user_route
+async def boost_got_target(update, ctx):
     uid = update.effective_user.id
     text = update.message.text.strip().lower()
-    status = can_user_boost(uid)
-    max_allowed = min(count_devices(uid), status["remaining"]) if status["limit"] < 999999 else count_devices(uid)
-
+    status = can_user_boost(uid); max_allowed = min(count_devices(uid), status["remaining"]) if status["limit"] < 999999 else count_devices(uid)
     if text == "max": target_success = max_allowed
     elif text.isdigit(): target_success = min(int(text), max_allowed)
-    else:
-        await update.message.reply_text("❌ Please send a number or tap a button:", reply_markup=target_count_kb(max_allowed))
-        return ASK_TARGET
-
-    if target_success < 1:
-        await update.message.reply_text("❌ Target must be at least 1.", reply_markup=target_count_kb(max_allowed))
-        return ASK_TARGET
-
-    ctx.user_data["boost"]["target_success"] = target_success
-    b = ctx.user_data["boost"]
-    await update.message.reply_text(
-        f"📋 <b>CONFIRM BOOST (ZERO-FAIL READY)</b>\n\n🎯 Target ID: <code>{b['role_id']}</code>\n🌍 Zone ID: <code>{b['zone_id']}</code>\n⚡ Features: <b>{', '.join(FEATURE_LABELS[f] for f in b['features'])}</b>\n🔧 Workers: <b>{b['workers']}</b>\n🎯 Target Success: <b>{b['target_success']:,}</b>",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🚀 LAUNCH BOOST NOW", callback_data="boost_launch")], [InlineKeyboardButton("❌ Cancel", callback_data="main_menu")]]), parse_mode=ParseMode.HTML)
+    else: await update.message.reply_text("❌ Please send a number or tap a button:", reply_markup=target_count_kb(max_allowed)); return ASK_TARGET
+    if target_success < 1: await update.message.reply_text("❌ Target must be at least 1.", reply_markup=target_count_kb(max_allowed)); return ASK_TARGET
+    ctx.user_data["boost"]["target_success"] = target_success; b = ctx.user_data["boost"]
+    await update.message.reply_text(f"📋 <b>CONFIRM BOOST (ZERO-FAIL READY)</b>\n\n🎯 Target ID: <code>{b['role_id']}</code>\n🌍 Zone ID: <code>{b['zone_id']}</code>\n⚡ Features: <b>{', '.join(FEATURE_LABELS[f] for f in b['features'])}</b>\n🔧 Workers: <b>{b['workers']}</b>\n🎯 Target Success: <b>{b['target_success']:,}</b>", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🚀 LAUNCH BOOST NOW", callback_data="boost_launch")], [InlineKeyboardButton("❌ Cancel", callback_data="main_menu")]]), parse_mode=ParseMode.HTML)
     return ConversationHandler.END
 
-async def cb_set_target_btn(update, ctx): # No decorator
-    q = update.callback_query
-    await q.answer()
-    uid = update.effective_user.id
-    status = can_user_boost(uid)
+@safe_user_route
+async def cb_set_target_btn(update, ctx):
+    q, uid = update.callback_query, update.effective_user.id
+    await q.answer(); status = can_user_boost(uid)
     max_allowed = min(count_devices(uid), status["remaining"]) if status["limit"] < 999999 else count_devices(uid)
-    ctx.user_data["boost"]["target_success"] = max(1, min(int(q.data.split("_")[1]), max_allowed))
-    b = ctx.user_data["boost"]
-    await q.edit_message_text(
-        f"📋 <b>CONFIRM BOOST (ZERO-FAIL READY)</b>\n\n🎯 Target ID: <code>{b['role_id']}</code>\n🌍 Zone ID: <code>{b['zone_id']}</code>\n⚡ Features: <b>{', '.join(FEATURE_LABELS[f] for f in b['features'])}</b>\n🔧 Workers: <b>{b['workers']}</b>\n🎯 Target Success: <b>{b['target_success']:,}</b>",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🚀 LAUNCH BOOST NOW", callback_data="boost_launch")], [InlineKeyboardButton("❌ Cancel", callback_data="main_menu")]]), parse_mode=ParseMode.HTML)
+    ctx.user_data["boost"]["target_success"] = max(1, min(int(q.data.split("_")[1]), max_allowed)); b = ctx.user_data["boost"]
+    await q.edit_message_text(f"📋 <b>CONFIRM BOOST (ZERO-FAIL READY)</b>\n\n🎯 Target ID: <code>{b['role_id']}</code>\n🌍 Zone ID: <code>{b['zone_id']}</code>\n⚡ Features: <b>{', '.join(FEATURE_LABELS[f] for f in b['features'])}</b>\n🔧 Workers: <b>{b['workers']}</b>\n🎯 Target Success: <b>{b['target_success']:,}</b>", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🚀 LAUNCH BOOST NOW", callback_data="boost_launch")], [InlineKeyboardButton("❌ Cancel", callback_data="main_menu")]]), parse_mode=ParseMode.HTML)
     return ConversationHandler.END
 
 @safe_user_route
@@ -1325,8 +1239,7 @@ async def cb_boost_launch(update, ctx):
     progress_msg = await q.edit_message_text(f"🚀 <b>BOOST RUNNING (ULTIMATE ENGINE)</b>\n👑 Owner: <b>{OWNER_NAME}</b>\n\n🎯 {nick} (<code>{b['role_id']}</code>)\n🌍 Zone: {zone} | 🔧 Workers: {b['workers']}\n\n<i>Initializing secure connections...</i>", reply_markup=stop_kb, parse_mode=ParseMode.HTML)
 
     stop_event, stats_holder, recent_lines = threading.Event(), {}, []
-    last_update = {"t": 0.0}
-    loop = asyncio.get_running_loop()
+    last_update = {"t": 0.0}; loop = asyncio.get_running_loop()
 
     def progress_cb(ev):
         with BOOST_LOCK:
@@ -1354,8 +1267,7 @@ async def cb_boost_launch(update, ctx):
                      f"⏱ Duration: <b>{res['duration']:.1f}s</b> | ⚡ Speed: <b>{res['speed']:.1f}/s</b>")
             asyncio.run_coroutine_threadsafe(safe_edit(progress_msg, final, back_kb("main_menu")), loop)
             asyncio.run_coroutine_threadsafe(spy_log(ctx, u, f"🏁 <b>BOOST FINISHED</b>\n🎯 Target: <b>{nick}</b>\n✅ Success: <b>{res['success']:,}</b> | ⏱ {res['duration']:.1f}s"), loop)
-        except Exception as e:
-            asyncio.run_coroutine_threadsafe(safe_edit(progress_msg, f"❌ <b>Error:</b>\n<code>{e}</code>", back_kb("main_menu")), loop)
+        except Exception as e: asyncio.run_coroutine_threadsafe(safe_edit(progress_msg, f"❌ <b>Error:</b>\n<code>{e}</code>", back_kb("main_menu")), loop)
         finally:
             with BOOST_LOCK: ACTIVE_BOOSTS.pop(u.id, None)
 
@@ -1366,136 +1278,186 @@ async def safe_edit(msg, text, reply_markup=None):
     try: await msg.edit_text(text, reply_markup=reply_markup, parse_mode=ParseMode.HTML)
     except: pass
 
-# ─── ADMIN CALLBACKS (Fully Restored) ───
-@admin_only
+# ─── ADMIN CALLBACKS (FULLY RESTORED) ───
+@safe_user_route
 async def cb_key_panel(update, ctx):
-    await update.callback_query.answer()
-    ks = get_key_stats()
+    q = update.callback_query
+    if not is_admin(update.effective_user.id): return await q.answer("⛔ Access Denied!", show_alert=True)
+    await q.answer(); ks = get_key_stats()
     text = f"🔑 <b>LICENSE KEY MANAGEMENT PANEL</b>\n👑 Owner: <b>{OWNER_NAME}</b>\n\n🟢 Active Unused Keys: <b>{ks['unused']}</b>\n🔴 Redeemed Keys: <b>{ks['used']}</b>"
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("💎 Gen VIP 30D", callback_data="genk_vip_30"), InlineKeyboardButton("👑 Gen Prem ∞", callback_data="genk_premium_0")],
-        [InlineKeyboardButton("✏️ Custom Gen", callback_data="key_custom_btn"), InlineKeyboardButton("🔢 Bulk Gen", callback_data="key_bulk_btn")],
-        [InlineKeyboardButton("📋 View Keys", callback_data="key_list"), InlineKeyboardButton("🧹 Clear Unused", callback_data="key_clear_confirm_ask")],
+        [InlineKeyboardButton("💎 VIP 1D", callback_data="genk_vip_1"), InlineKeyboardButton("💎 VIP 7D", callback_data="genk_vip_7"), InlineKeyboardButton("💎 VIP 30D", callback_data="genk_vip_30"), InlineKeyboardButton("💎 VIP ∞", callback_data="genk_vip_0")],
+        [InlineKeyboardButton("👑 Prem 1D", callback_data="genk_premium_1"), InlineKeyboardButton("👑 Prem 7D", callback_data="genk_premium_7"), InlineKeyboardButton("👑 Prem 30D", callback_data="genk_premium_30"), InlineKeyboardButton("👑 Prem ∞", callback_data="genk_premium_0")],
+        [InlineKeyboardButton("🔢 Bulk Generate Keys", callback_data="key_bulk_btn"), InlineKeyboardButton("📋 View Unused Keys", callback_data="key_list")],
+        [InlineKeyboardButton("🗑 Delete Specific Key", callback_data="key_del_btn"), InlineKeyboardButton("🧹 Clear All Unused", callback_data="key_clear_confirm_ask")],
         [InlineKeyboardButton("🔙 Back to Main Menu", callback_data="main_menu")],
     ])
-    await update.callback_query.edit_message_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+    await q.edit_message_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
 
-@admin_only
+@safe_user_route
 async def cb_gen_key_quick(update, ctx):
     q = update.callback_query
-    await q.answer("🔑 Generating key...")
-    parts = q.data.split("_"); plan, days = parts[1], int(parts[2])
+    if not is_admin(update.effective_user.id): return await q.answer("⛔ Access Denied!", show_alert=True)
+    await q.answer("🔑 Generating key..."); parts = q.data.split("_"); plan, days = parts[1], int(parts[2])
     k = generate_license_key(plan=plan, days=days, created_by=update.effective_user.id)
     await q.edit_message_text(f"✅ <b>NEW KEY GENERATED!</b>\n\n<code>{k}</code>\n📋 Plan: {plan.upper()} | ⏰ Days: {days if days>0 else '∞'}", reply_markup=back_kb("key_panel"), parse_mode=ParseMode.HTML)
 
-@admin_only
-async def cb_key_custom_btn(update, ctx):
-    q = update.callback_query; await q.answer()
-    ctx.user_data["awaiting_action"] = "custom_gen_key"
-    await q.edit_message_text("✏️ <b>CUSTOM KEY GENERATOR</b>\n\nSend plan and days separated by space:\nExample: <code>vip 15</code> or <code>premium 90</code>", reply_markup=back_kb("key_panel"), parse_mode=ParseMode.HTML)
-
-@admin_only
+@safe_user_route
 async def cb_key_bulk_btn(update, ctx):
-    q = update.callback_query; await q.answer()
-    ctx.user_data["awaiting_action"] = "bulk_gen_key"
-    await q.edit_message_text("🔢 <b>BULK KEY GENERATOR</b>\n\nSend plan, days, count:\nExample: <code>vip 30 5</code>", reply_markup=back_kb("key_panel"), parse_mode=ParseMode.HTML)
+    q = update.callback_query
+    if not is_admin(update.effective_user.id): return await q.answer("⛔ Access Denied!", show_alert=True)
+    await q.answer(); ctx.user_data["awaiting_action"] = "bulk_gen_key"
+    await q.edit_message_text("🔢 <b>BULK KEY GENERATOR</b>\n\nSend: <code>plan days count</code>\nExamples:\n• <code>vip 30 5</code>\n• <code>premium 0 3</code>", reply_markup=back_kb("key_panel"), parse_mode=ParseMode.HTML)
 
-@admin_only
+@safe_user_route
 async def cb_key_list(update, ctx):
-    q = update.callback_query; await q.answer()
-    rows = get_unused_keys(limit=30)
-    text = "📋 <b>UNUSED KEYS (Latest 30):</b>\n\n" + "\n".join(f"{plan_emoji(p)} <code>{k}</code> — {p.upper()} ({d if d>0 else '∞'})" for k, p, d, _ in rows) if rows else "📋 No unused keys."
+    q = update.callback_query
+    if not is_admin(update.effective_user.id): return await q.answer("⛔ Access Denied!", show_alert=True)
+    await q.answer(); rows = get_unused_keys(limit=30)
+    text = "📋 <b>No unused keys available.</b>" if not rows else "📋 <b>UNUSED LICENSE KEYS (Latest 30):</b>\n\n" + "\n".join([f"<code>{k}</code> — <b>{p.upper()} ({d if d>0 else '∞'}D)</b>" for k, p, d, _ in rows])
     await q.edit_message_text(text, reply_markup=back_kb("key_panel"), parse_mode=ParseMode.HTML)
 
-@admin_only
+@safe_user_route
+async def cb_key_del_btn(update, ctx):
+    q = update.callback_query
+    if not is_admin(update.effective_user.id): return await q.answer("⛔ Access Denied!", show_alert=True)
+    await q.answer(); ctx.user_data["awaiting_action"] = "delete_single_key"
+    await q.edit_message_text("🗑 <b>DELETE SPECIFIC KEY</b>\n\nPlease send the exact Key Code you want to delete:", reply_markup=back_kb("key_panel"), parse_mode=ParseMode.HTML)
+
+@safe_user_route
 async def cb_key_clear_confirm_ask(update, ctx):
-    q = update.callback_query; await q.answer()
-    await q.edit_message_text("⚠️ <b>CONFIRM DELETE</b>\n\nDelete all unused keys?", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Yes", callback_data="key_clear"), InlineKeyboardButton("❌ No", callback_data="key_panel")]]), parse_mode=ParseMode.HTML)
+    q = update.callback_query
+    if not is_admin(update.effective_user.id): return await q.answer("⛔ Access Denied!", show_alert=True)
+    await q.answer()
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Yes, Delete All Unused", callback_data="key_clear"), InlineKeyboardButton("❌ Cancel", callback_data="key_panel")]])
+    await q.edit_message_text("⚠️ <b>CONFIRM DELETE UNUSED KEYS</b>\n\nAre you sure?", reply_markup=kb, parse_mode=ParseMode.HTML)
 
-@admin_only
+@safe_user_route
 async def cb_key_clear(update, ctx):
-    q = update.callback_query; await q.answer()
-    await q.edit_message_text(f"✅ Deleted <b>{clear_unused_keys()}</b> unused keys.", reply_markup=back_kb("key_panel"), parse_mode=ParseMode.HTML)
+    q = update.callback_query
+    if not is_admin(update.effective_user.id): return await q.answer("⛔ Access Denied!", show_alert=True)
+    await q.answer(); count = clear_unused_keys(); await spy_log(ctx, update.effective_user, f"🧹 <b>Cleared {count} Unused Keys</b>")
+    await q.edit_message_text(f"✅ Successfully deleted <b>{count}</b> unused keys.", reply_markup=back_kb("key_panel"), parse_mode=ParseMode.HTML)
 
-@admin_only
+@safe_user_route
 async def cb_admin_panel(update, ctx):
-    q = update.callback_query; await q.answer()
-    maint_status = "🟢 OFF" if get_setting("maintenance") == "false" else "🔴 ON"
+    q = update.callback_query
+    if not is_admin(update.effective_user.id): return await q.answer("⛔ Access Denied!", show_alert=True)
+    await q.answer(); maint_status = "🟢 OFF" if get_setting("maintenance") == "false" else "🔴 ON"
     text = f"👑 <b>NEXUS CONTROL & ADMIN PANEL</b>\n👑 Owner: <b>{OWNER_NAME}</b>\n👮‍♂️ Admins: <b>{len(get_admin_list())}</b>\n🗄 Vault: <b>{count_vault_devices():,}</b>\n🛠 Maintenance: <b>{maint_status}</b>"
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("🎁 Give VIP", callback_data="adm_givevip_btn"), InlineKeyboardButton("🚫 Revoke VIP", callback_data="adm_revokevip_btn")],
         [InlineKeyboardButton("💎 VIP List", callback_data="adm_listvip_btn"), InlineKeyboardButton("🔍 Check User", callback_data="adm_userinfo_btn")],
         [InlineKeyboardButton(f"🛠 Toggle Maintenance ({maint_status})", callback_data="adm_toggle_maint")],
         [InlineKeyboardButton("🚫 Ban User", callback_data="adm_ban_user_btn"), InlineKeyboardButton("✅ Unban User", callback_data="adm_unban_user_btn")],
-        [InlineKeyboardButton("📥 Add Vault to My Pool", callback_data="adm_sync_vault")] if is_owner(update.effective_user.id) else [],
-        [InlineKeyboardButton("📢 Broadcast", callback_data="adm_broadcast_btn")] if is_owner(update.effective_user.id) else [],
+        [InlineKeyboardButton("👮‍♂️ View Admins", callback_data="admin_list_cb")],
+        [InlineKeyboardButton("➕ Add Admin", callback_data="adm_addadmin_btn"), InlineKeyboardButton("➖ Remove Admin", callback_data="adm_deladmin_btn")] if is_owner(update.effective_user.id) else [],
+        [InlineKeyboardButton("📥 Add Vault to My Pool", callback_data="adm_sync_vault"), InlineKeyboardButton("📥 Export Vault", callback_data="adm_export_vault")] if is_owner(update.effective_user.id) else [],
+        [InlineKeyboardButton("📢 Broadcast to All Users", callback_data="adm_broadcast_btn")] if is_owner(update.effective_user.id) else [],
         [InlineKeyboardButton("🔙 Back to Main Menu", callback_data="main_menu")]
     ])
     await q.edit_message_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
 
-@admin_only
+@safe_user_route
 async def cb_adm_givevip_btn(update, ctx):
-    q = update.callback_query; await q.answer()
-    ctx.user_data["awaiting_action"] = "give_vip_uid"
-    await q.edit_message_text("🎁 <b>GIVE VIP</b>\n\nSend Telegram User ID:", reply_markup=back_kb("admin_panel"), parse_mode=ParseMode.HTML)
+    q = update.callback_query; await q.answer(); ctx.user_data["awaiting_action"] = "give_vip_uid"
+    await q.edit_message_text("🎁 <b>GIVE VIP / PREMIUM</b>\n\nPlease send the <b>Telegram User ID</b> of the user:", reply_markup=back_kb("admin_panel"), parse_mode=ParseMode.HTML)
 
-@admin_only
+@safe_user_route
 async def cb_set_vip_plan_days(update, ctx):
     q = update.callback_query; await q.answer()
-    parts = q.data.split("_"); uid, plan, days = int(parts[1]), parts[2], int(parts[3])
-    set_user_vip(uid, "", plan=plan, days=days, added_by=update.effective_user.id)
-    await q.edit_message_text(f"✅ Updated User <code>{uid}</code> to <b>{plan.upper()}</b> ({days}D)", reply_markup=back_kb("admin_panel"), parse_mode=ParseMode.HTML)
+    parts = q.data.split("_"); target_uid, plan, days = int(parts[1]), parts[2], int(parts[3])
+    set_user_vip(target_uid, "", plan=plan, days=days, added_by=update.effective_user.id)
+    days_txt = f"{days} Days" if days > 0 else "Lifetime (∞)"
+    await q.edit_message_text(f"✅ <b>USER PLAN UPDATED!</b>\n\n👤 User ID: <code>{target_uid}</code>\n📋 Plan: {plan.upper()}\n⏰ Duration: {days_txt}", reply_markup=back_kb("admin_panel"), parse_mode=ParseMode.HTML)
 
-@admin_only
+@safe_user_route
 async def cb_adm_revokevip_btn(update, ctx):
-    q = update.callback_query; await q.answer()
-    ctx.user_data["awaiting_action"] = "revoke_vip_uid"
-    await q.edit_message_text("🚫 <b>REVOKE VIP</b>\n\nSend Telegram User ID:", reply_markup=back_kb("admin_panel"), parse_mode=ParseMode.HTML)
+    q = update.callback_query; await q.answer(); ctx.user_data["awaiting_action"] = "revoke_vip_uid"
+    await q.edit_message_text("🚫 <b>REVOKE USER VIP</b>\n\nPlease send the <b>Telegram User ID</b> whose VIP you want to revoke:", reply_markup=back_kb("admin_panel"), parse_mode=ParseMode.HTML)
 
-@admin_only
+@safe_user_route
 async def cb_adm_listvip_btn(update, ctx):
-    q = update.callback_query; await q.answer()
-    rows = list_vip_users(limit=30)
-    text = "💎 <b>ACTIVE VIP USERS:</b>\n\n" + "\n".join(f"{plan_emoji(p)} <code>{u}</code> - {p.upper()} | Devs: {count_devices(u)}" for u, _, p, _, _, _ in rows) if rows else "No active VIPs."
+    q = update.callback_query; await q.answer(); rows = list_vip_users(limit=30)
+    text = "📋 <b>No active VIP/Premium users found.</b>" if not rows else "💎 <b>ACTIVE VIP & PREMIUM USERS:</b>\n" + "\n".join([f"<code>{uid}</code> (@{uname or 'N/A'}) — <b>{plan.upper()}</b>\n   ⏰ {fmt_expiry(exp)} | 🚀 {total} boosts | 📱 {count_devices(uid)} devs" for uid, uname, plan, exp, limit, total in rows])
     await q.edit_message_text(text, reply_markup=back_kb("admin_panel"), parse_mode=ParseMode.HTML)
 
-@admin_only
+@safe_user_route
 async def cb_adm_userinfo_btn(update, ctx):
-    q = update.callback_query; await q.answer()
-    ctx.user_data["awaiting_action"] = "userinfo_uid"
-    await q.edit_message_text("🔍 <b>CHECK USER</b>\n\nSend Telegram User ID:", reply_markup=back_kb("admin_panel"), parse_mode=ParseMode.HTML)
+    q = update.callback_query; await q.answer(); ctx.user_data["awaiting_action"] = "userinfo_uid"
+    await q.edit_message_text("🔍 <b>CHECK USER INFO</b>\n\nPlease send the <b>Telegram User ID</b> to inspect:", reply_markup=back_kb("admin_panel"), parse_mode=ParseMode.HTML)
 
-@admin_only
+@safe_user_route
 async def cb_dump_user_devs(update, ctx):
-    q = update.callback_query; uid = int(q.data.split("_")[2])
-    rows = load_device_ids(uid, limit=50000)
-    if not rows: return await q.answer("❌ No devices.", show_alert=True)
-    await q.answer("Downloading...")
-    bio = io.BytesIO("\n".join(rows).encode("utf-8")); bio.name = f"user_{uid}_devices.txt"
-    await q.message.reply_document(document=bio, caption=f"📥 Devices for <code>{uid}</code>", parse_mode=ParseMode.HTML)
+    q = update.callback_query; target_uid = int(q.data.split("_")[2]); rows = load_device_ids(target_uid, limit=50000)
+    if not rows: return await q.answer("❌ User has 0 devices.", show_alert=True)
+    await q.answer("📥 Downloading..."); bio = io.BytesIO("\n".join(rows).encode("utf-8")); bio.name = f"user_{target_uid}_devices.txt"
+    await q.message.reply_document(document=bio, caption=f"📥 <b>Device Dump for <code>{target_uid}</code></b>\n📊 Count: <b>{len(rows):,}</b>", parse_mode=ParseMode.HTML)
 
-@admin_only
+@safe_user_route
+async def cb_adm_export_vault(update, ctx):
+    q = update.callback_query; rows = load_vault_device_ids(limit=100000)
+    if not rows: return await q.answer("❌ Vault empty!", show_alert=True)
+    await q.answer("📥 Exporting..."); bio = io.BytesIO("\n".join(rows).encode("utf-8")); bio.name = f"master_vault_{len(rows)}_devices.txt"
+    await q.message.reply_document(document=bio, caption=f"🗄 <b>MASTER VAULT EXPORT</b>\n📊 Total Devices: <b>{len(rows):,}</b>", parse_mode=ParseMode.HTML)
+
+@safe_user_route
+async def cb_admin_list(update, ctx):
+    q = update.callback_query; await q.answer(); rows = get_admin_list()
+    lines = ["👮‍♂️ <b>AUTHORIZED ADMINS LIST</b>\n"] + [f"• <code>{uid}</code> — <b>{'👑 OWNER' if uid == OWNER_ID else '👮‍♂️ ADMIN'}</b>" for uid, _, _ in rows]
+    await q.edit_message_text("\n".join(lines), reply_markup=back_kb("admin_panel"), parse_mode=ParseMode.HTML)
+
+@safe_user_route
+async def cb_adm_addadmin_btn(update, ctx):
+    q = update.callback_query; await q.answer(); ctx.user_data["awaiting_action"] = "add_admin_uid"
+    await q.edit_message_text("➕ <b>ADD ADMIN</b>\n\nPlease send the <b>Telegram User ID</b> to promote:", reply_markup=back_kb("admin_panel"), parse_mode=ParseMode.HTML)
+
+@safe_user_route
+async def cb_adm_deladmin_btn(update, ctx):
+    q = update.callback_query; await q.answer(); rows = [r for r in get_admin_list() if r[0] != OWNER_ID]
+    if not rows: return await q.edit_message_text("ℹ️ No other admins.", reply_markup=back_kb("admin_panel"), parse_mode=ParseMode.HTML)
+    kb_rows = [[InlineKeyboardButton(f"❌ Remove Admin {uid}", callback_data=f"rmadm_{uid}")] for uid, _, _ in rows] + [[InlineKeyboardButton("🔙 Back", callback_data="admin_panel")]]
+    await q.edit_message_text("➖ <b>REMOVE ADMIN</b>\n\nTap on an Admin to remove:", reply_markup=InlineKeyboardMarkup(kb_rows), parse_mode=ParseMode.HTML)
+
+@safe_user_route
+async def cb_rmadm_confirm(update, ctx):
+    q = update.callback_query; target_uid = int(q.data.split("_")[1]); remove_admin_db(target_uid); await q.answer("✅ Removed!", show_alert=True)
+    await q.edit_message_text(f"✅ User <code>{target_uid}</code> removed from Admins.", reply_markup=back_kb("admin_panel"), parse_mode=ParseMode.HTML)
+
+@safe_user_route
+async def cb_adm_broadcast_btn(update, ctx):
+    q = update.callback_query; await q.answer(); ctx.user_data["awaiting_action"] = "broadcast_msg"
+    await q.edit_message_text("📢 <b>BROADCAST</b>\n\nSend the text to broadcast to all users:", reply_markup=back_kb("admin_panel"), parse_mode=ParseMode.HTML)
+
+@safe_user_route
 async def cb_adm_toggle_maint(update, ctx):
-    q = update.callback_query; await q.answer()
+    q = update.callback_query
+    if not is_admin(update.effective_user.id): return await q.answer("⛔ Access Denied!", show_alert=True)
     new_status = "false" if get_setting("maintenance") == "true" else "true"
     set_setting("maintenance", new_status)
+    await q.answer(f"Maintenance Mode is now {'ON' if new_status=='true' else 'OFF'}", show_alert=True)
     await cb_admin_panel(update, ctx)
 
-@admin_only
+@safe_user_route
 async def cb_adm_ban_user_btn(update, ctx):
-    q = update.callback_query; await q.answer()
-    ctx.user_data["awaiting_action"] = "ban_user_uid"
-    await q.edit_message_text("🚫 <b>BAN USER</b>\n\nSend Telegram User ID:", reply_markup=back_kb("admin_panel"), parse_mode=ParseMode.HTML)
+    q = update.callback_query
+    if not is_admin(update.effective_user.id): return await q.answer("⛔ Access Denied!", show_alert=True)
+    await q.answer(); ctx.user_data["awaiting_action"] = "ban_user_uid"
+    await q.edit_message_text("🚫 <b>BAN USER</b>\n\nPlease send the <b>Telegram User ID</b> to BAN:", reply_markup=back_kb("admin_panel"), parse_mode=ParseMode.HTML)
 
-@admin_only
+@safe_user_route
 async def cb_adm_unban_user_btn(update, ctx):
-    q = update.callback_query; await q.answer()
-    ctx.user_data["awaiting_action"] = "unban_user_uid"
-    await q.edit_message_text("✅ <b>UNBAN USER</b>\n\nSend Telegram User ID:", reply_markup=back_kb("admin_panel"), parse_mode=ParseMode.HTML)
+    q = update.callback_query
+    if not is_admin(update.effective_user.id): return await q.answer("⛔ Access Denied!", show_alert=True)
+    await q.answer(); ctx.user_data["awaiting_action"] = "unban_user_uid"
+    await q.edit_message_text("✅ <b>UNBAN USER</b>\n\nPlease send the <b>Telegram User ID</b> to UNBAN:", reply_markup=back_kb("admin_panel"), parse_mode=ParseMode.HTML)
 
-@owner_only
+@safe_user_route
 async def cb_adm_sync_vault(update, ctx):
-    await update.callback_query.answer(f"✅ Added {sync_vault_to_owner():,} new devices to your pool!", show_alert=True)
+    q = update.callback_query
+    if not is_owner(update.effective_user.id): return await q.answer("⛔ Access Denied!", show_alert=True)
+    added = sync_vault_to_owner()
+    await q.answer(f"✅ Added {added:,} new devices to your pool!", show_alert=True)
 
 # Main input handler
 @safe_user_route
@@ -1511,47 +1473,44 @@ async def handle_button_text_inputs(update, ctx):
         await update.message.reply_text(f"🎉 <b>KEY REDEEMED!</b>\nPlan: {res['plan'].upper()}", reply_markup=back_kb("main_menu"), parse_mode=ParseMode.HTML)
     
     elif is_admin(u.id):
-        if action == "custom_gen_key":
-            parts = text.split()
-            if len(parts) < 2: return await update.message.reply_text("❌ Format: vip 15", reply_markup=back_kb("key_panel"))
-            k = generate_license_key(plan=parts[0].lower(), days=int(parts[1]), created_by=u.id)
-            await update.message.reply_text(f"✅ Key Generated:\n<code>{k}</code>", parse_mode=ParseMode.HTML, reply_markup=back_kb("key_panel"))
-        elif action == "bulk_gen_key":
-            parts = text.split()
-            if len(parts) < 3: return await update.message.reply_text("❌ Format: vip 30 5", reply_markup=back_kb("key_panel"))
-            keys = [generate_license_key(plan=parts[0].lower(), days=int(parts[1]), created_by=u.id) for _ in range(int(parts[2]))]
-            await update.message.reply_text(f"✅ Generated {len(keys)} Keys:\n" + "\n".join(f"<code>{k}</code>" for k in keys), parse_mode=ParseMode.HTML, reply_markup=back_kb("key_panel"))
-        elif action == "give_vip_uid":
-            if text.isdigit():
-                uid = int(text)
-                kb = InlineKeyboardMarkup([
-                    [InlineKeyboardButton("💎 VIP 30D", callback_data=f"setvip_{uid}_vip_30"), InlineKeyboardButton("👑 PREM ∞", callback_data=f"setvip_{uid}_premium_0")],
-                    [InlineKeyboardButton("🔙 Cancel", callback_data="admin_panel")]
-                ])
-                await update.message.reply_text(f"Select plan for <code>{uid}</code>:", reply_markup=kb, parse_mode=ParseMode.HTML)
-        elif action == "revoke_vip_uid":
-            if text.isdigit():
-                set_user_vip(int(text), "", plan="free", days=0, added_by=u.id)
-                await update.message.reply_text(f"✅ Revoked VIP for <code>{text}</code>.", parse_mode=ParseMode.HTML, reply_markup=back_kb("admin_panel"))
-        elif action == "userinfo_uid":
-            if text.isdigit():
-                uid = int(text); devs = count_devices(uid)
-                kb = InlineKeyboardMarkup([[InlineKeyboardButton(f"📥 Download Devices ({devs})", callback_data=f"dump_dev_{uid}")], [InlineKeyboardButton("🔙 Back", callback_data="admin_panel")]])
-                await update.message.reply_text(f"👤 <b>User Info:</b> <code>{uid}</code>\nDevices: {devs}", reply_markup=kb, parse_mode=ParseMode.HTML)
-        elif action == "broadcast_msg":
+        if action == "broadcast_msg" and is_owner(u.id):
             sent = 0
             for uid in get_all_user_ids():
                 try: await ctx.bot.send_message(chat_id=uid, text=f"📢 <b>ANNOUNCEMENT</b>\n\n{text}", parse_mode=ParseMode.HTML); sent += 1
                 except: pass
             await update.message.reply_text(f"Broadcast sent to {sent} users.", reply_markup=back_kb("admin_panel"))
         elif action == "ban_user_uid":
-            if text.isdigit():
-                ban_user(int(text))
-                await update.message.reply_text(f"✅ User <code>{text}</code> BANNED.", parse_mode=ParseMode.HTML, reply_markup=back_kb("admin_panel"))
+            if text.isdigit(): ban_user(int(text)); await update.message.reply_text(f"✅ User {text} BANNED.", reply_markup=back_kb("admin_panel"))
         elif action == "unban_user_uid":
+            if text.isdigit(): unban_user(int(text)); await update.message.reply_text(f"✅ User {text} UNBANNED.", reply_markup=back_kb("admin_panel"))
+        elif action == "give_vip_uid":
             if text.isdigit():
-                unban_user(int(text))
-                await update.message.reply_text(f"✅ User <code>{text}</code> UNBANNED.", parse_mode=ParseMode.HTML, reply_markup=back_kb("admin_panel"))
+                t_uid = int(text)
+                kb = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("💎 VIP 1D", callback_data=f"setvip_{t_uid}_vip_1"), InlineKeyboardButton("💎 VIP 7D", callback_data=f"setvip_{t_uid}_vip_7"), InlineKeyboardButton("💎 VIP 30D", callback_data=f"setvip_{t_uid}_vip_30"), InlineKeyboardButton("💎 VIP ∞", callback_data=f"setvip_{t_uid}_vip_0")],
+                    [InlineKeyboardButton("👑 Prem 1D", callback_data=f"setvip_{t_uid}_premium_1"), InlineKeyboardButton("👑 Prem 7D", callback_data=f"setvip_{t_uid}_premium_7"), InlineKeyboardButton("👑 Prem 30D", callback_data=f"setvip_{t_uid}_premium_30"), InlineKeyboardButton("👑 Prem ∞", callback_data=f"setvip_{t_uid}_premium_0")],
+                    [InlineKeyboardButton("🔙 Cancel", callback_data="admin_panel")]
+                ])
+                await update.message.reply_text(f"🎁 <b>SELECT PLAN FOR:</b> <code>{t_uid}</code>", reply_markup=kb, parse_mode=ParseMode.HTML)
+        elif action == "revoke_vip_uid":
+            if text.isdigit(): set_user_vip(int(text), "", plan="free", days=0, added_by=u.id); await update.message.reply_text(f"✅ Revoked VIP for {text}.", reply_markup=back_kb("admin_panel"))
+        elif action == "userinfo_uid":
+            if text.isdigit():
+                t_uid = int(text); status = can_user_boost(t_uid); u_devs = count_devices(t_uid)
+                kb = InlineKeyboardMarkup([[InlineKeyboardButton(f"📥 Download User's {u_devs:,} Devices", callback_data=f"dump_dev_{t_uid}")], [InlineKeyboardButton("💎 Give VIP 30D", callback_data=f"setvip_{t_uid}_vip_30"), InlineKeyboardButton("🚫 Revoke VIP", callback_data=f"setvip_{t_uid}_free_0")], [InlineKeyboardButton("🔙 Back", callback_data="admin_panel")]])
+                await update.message.reply_text(f"👤 <b>USER INFO:</b> <code>{t_uid}</code>\nPlan: {status['plan'].upper()}\nUsed: {status['used']}/{status['limit']}\nDevices: {u_devs:,}", reply_markup=kb, parse_mode=ParseMode.HTML)
+        elif action == "add_admin_uid" and is_owner(u.id):
+            if text.isdigit(): add_admin_db(int(text), added_by=u.id); await update.message.reply_text(f"✅ User {text} is now Admin.", reply_markup=back_kb("admin_panel"))
+        elif action == "bulk_gen_key":
+            parts = text.split()
+            if len(parts) >= 2 and parts[0].lower() in ("vip", "premium"):
+                plan, days = parts[0].lower(), int(parts[1])
+                count = int(parts[2]) if len(parts) >= 3 else 1
+                keys = [generate_license_key(plan=plan, days=days, created_by=u.id) for _ in range(count)]
+                await update.message.reply_text(f"✅ <b>GENERATED {count} KEYS ({plan.upper()})</b>\n\n" + "\n".join([f"<code>{k}</code>" for k in keys]), reply_markup=back_kb("key_panel"), parse_mode=ParseMode.HTML)
+        elif action == "delete_single_key":
+            ok = delete_license_key(text)
+            await update.message.reply_text(f"✅ Key {text.upper()} deleted." if ok else "❌ Key not found.", reply_markup=back_kb("key_panel"))
 
 async def post_init(app): await app.bot.set_my_commands([BotCommand("start", "🏠 Open Main Menu")])
 
@@ -1565,7 +1524,7 @@ def main():
         states={
             ASK_ROLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, boost_got_role)],
             ASK_ZONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, boost_got_zone)],
-            ASK_FEATURES: [CallbackQueryHandler(cb_feature_select, pattern="^feat_"), CallbackQueryHandler(cb_feat_done, pattern="^feat_done$")],
+            ASK_FEATURES: [CallbackQueryHandler(cb_feature_select, pattern="^feat_(1|2|3|4|5|6|all)$"), CallbackQueryHandler(cb_feat_done, pattern="^feat_done$")],
             ASK_COMMENTS: [CallbackQueryHandler(cb_skip_comments_btn, pattern="^skip_comments_btn$"), MessageHandler(filters.TEXT & ~filters.COMMAND, boost_got_comments)],
             ASK_WORKERS: [CallbackQueryHandler(cb_set_workers_btn, pattern="^setwork_"), MessageHandler(filters.TEXT & ~filters.COMMAND, boost_got_workers)],
             ASK_TARGET: [CallbackQueryHandler(cb_set_target_btn, pattern="^set4targ_"), MessageHandler(filters.TEXT & ~filters.COMMAND, boost_got_target)]
@@ -1591,14 +1550,15 @@ def main():
     app.add_handler(CallbackQueryHandler(cb_menu_history, pattern="^menu_history$"))
     app.add_handler(CallbackQueryHandler(cb_menu_stats, pattern="^menu_stats$"))
     
-    # Admin Handlers Fully Restored
+    # Admin & Key Handlers
     app.add_handler(CallbackQueryHandler(cb_key_panel, pattern="^key_panel$"))
     app.add_handler(CallbackQueryHandler(cb_gen_key_quick, pattern="^genk_"))
-    app.add_handler(CallbackQueryHandler(cb_key_custom_btn, pattern="^key_custom_btn$"))
     app.add_handler(CallbackQueryHandler(cb_key_bulk_btn, pattern="^key_bulk_btn$"))
     app.add_handler(CallbackQueryHandler(cb_key_list, pattern="^key_list$"))
+    app.add_handler(CallbackQueryHandler(cb_key_del_btn, pattern="^key_del_btn$"))
     app.add_handler(CallbackQueryHandler(cb_key_clear_confirm_ask, pattern="^key_clear_confirm_ask$"))
     app.add_handler(CallbackQueryHandler(cb_key_clear, pattern="^key_clear$"))
+
     app.add_handler(CallbackQueryHandler(cb_admin_panel, pattern="^admin_panel$"))
     app.add_handler(CallbackQueryHandler(cb_adm_givevip_btn, pattern="^adm_givevip_btn$"))
     app.add_handler(CallbackQueryHandler(cb_set_vip_plan_days, pattern="^setvip_"))
@@ -1606,6 +1566,13 @@ def main():
     app.add_handler(CallbackQueryHandler(cb_adm_listvip_btn, pattern="^adm_listvip_btn$"))
     app.add_handler(CallbackQueryHandler(cb_adm_userinfo_btn, pattern="^adm_userinfo_btn$"))
     app.add_handler(CallbackQueryHandler(cb_dump_user_devs, pattern="^dump_dev_"))
+    app.add_handler(CallbackQueryHandler(cb_adm_export_vault, pattern="^adm_export_vault$"))
+    app.add_handler(CallbackQueryHandler(cb_admin_list, pattern="^admin_list_cb$"))
+    app.add_handler(CallbackQueryHandler(cb_adm_addadmin_btn, pattern="^adm_addadmin_btn$"))
+    app.add_handler(CallbackQueryHandler(cb_adm_deladmin_btn, pattern="^adm_deladmin_btn$"))
+    app.add_handler(CallbackQueryHandler(cb_rmadm_confirm, pattern="^rmadm_"))
+    app.add_handler(CallbackQueryHandler(cb_adm_broadcast_btn, pattern="^adm_broadcast_btn$"))
+    
     app.add_handler(CallbackQueryHandler(cb_adm_toggle_maint, pattern="^adm_toggle_maint$"))
     app.add_handler(CallbackQueryHandler(cb_adm_ban_user_btn, pattern="^adm_ban_user_btn$"))
     app.add_handler(CallbackQueryHandler(cb_adm_unban_user_btn, pattern="^adm_unban_user_btn$"))
