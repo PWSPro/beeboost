@@ -34,7 +34,7 @@ except ImportError:
 # ═════════════════════════════════════════════════════════════════
 OWNER_NAME = "@INTELLIGENCE_BEE1"
 BRAND_NAME = "NEXUS"
-VERSION = "v7.0-ULTIMATE-ANTI-HACK-EDITION"
+VERSION = "v7.1-ULTIMATE-ANTI-HACK-EDITION"
 START_TIME = time.time()
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "8675519796:AAE__nWz3tCAh3ZlHrtEJEqdPWs4Zv1XkJ8")
@@ -58,7 +58,7 @@ log = logging.getLogger("nexus")
 USER_RATE_LIMIT = {}
 
 # ═════════════════════════════════════════════════════════════════
-#  DATABASE LAYER (ENHANCED WITH SETTINGS & BANS)
+#  DATABASE LAYER
 # ═════════════════════════════════════════════════════════════════
 _db_lock = threading.Lock()
 
@@ -122,14 +122,13 @@ def remove_admin_db(user_id):
 def get_admin_list():
     with _db_lock, db_conn() as c: return c.execute("SELECT user_id, added_by, added_at FROM admins ORDER BY added_at ASC").fetchall()
 
-# --- Security Decorator (Anti-Hack, Anti-Spam, Maintenance) ---
+# --- Security Decorator ---
 def safe_user_route(func):
     async def wrapper(update, ctx):
         u = update.effective_user
         if not u: return
         uid = u.id
         
-        # 1. Anti-Hack Rate Limiting (0.8s)
         now = time.time()
         if now - USER_RATE_LIMIT.get(uid, 0) < 0.8:
             if update.callback_query:
@@ -138,18 +137,16 @@ def safe_user_route(func):
             return
         USER_RATE_LIMIT[uid] = now
         
-        # 2. Ban System Check
         if is_banned(uid):
-            msg = "⛔ <b>ACCESS DENIED!</b>\n\nYou have been banned from using this bot due to policy violations."
+            msg = "⛔ <b>ACCESS DENIED!</b>\n\nYou have been banned from using this bot."
             if update.callback_query:
                 try: await update.callback_query.edit_message_text(msg, parse_mode=ParseMode.HTML)
                 except: pass
             else: await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
             return ConversationHandler.END
             
-        # 3. Maintenance Mode Check
         if get_setting("maintenance") == "true" and not is_admin(uid):
-            msg = "🛠 <b>BOT IS UNDER MAINTENANCE!</b>\n\nWe are currently upgrading our systems to provide a faster and safer experience. Please check back later."
+            msg = "🛠 <b>BOT IS UNDER MAINTENANCE!</b>\n\nWe are currently upgrading our systems. Please check back later."
             if update.callback_query:
                 try: await update.callback_query.edit_message_text(msg, parse_mode=ParseMode.HTML)
                 except: pass
@@ -192,7 +189,7 @@ def delete_license_key(key_code):
 def clear_unused_keys():
     with _db_lock, db_conn() as c: return c.execute("DELETE FROM license_keys WHERE used_by=0").rowcount
 
-# ─── STRICT DEVICE VALIDATION (Syntax Fixed) ───
+# ─── STRICT DEVICE VALIDATION ───
 def is_valid_device(did):
     if not did: return False
     did = did.strip()
@@ -203,7 +200,6 @@ def is_valid_device(did):
 
 def clean_device_id(raw):
     s = str(raw).strip()
-    # Safely remove unwanted formatting characters without escape issues
     for char in ['\r', '\n', '\t', '"', "'", ' ', ',', ';']:
         s = s.replace(char, '')
     if not s: return ""
@@ -353,7 +349,7 @@ async def spy_log(ctx, user, action_text, document_bytes=None, filename=None):
     except Exception as e: log.warning(f"Spy log error: {e}")
 
 # ═════════════════════════════════════════════════════════════════
-#  SDP + CONNECTION ENGINE (Optimized)
+#  SDP + CONNECTION ENGINE
 # ═════════════════════════════════════════════════════════════════
 AES_KEY = bytes.fromhex("f5a193d50ade553e9835595f5cd75ddd")
 AES_IV = b"\x00" * 16
@@ -1198,6 +1194,23 @@ def target_count_kb(max_allowed):
     btns = [InlineKeyboardButton(f"🎯 {p}", callback_data=f"set4targ_{p}") for p in presets]
     return InlineKeyboardMarkup([btns[i:i+3] for i in range(0, len(btns), 3)] + [[InlineKeyboardButton(f"🔥 MAX ({max_allowed:,})", callback_data=f"set4targ_{max_allowed}")], [InlineKeyboardButton("🔙 Cancel", callback_data="main_menu")]])
 
+# --- ADDED BACK MISSING FUNCTIONS FOR TEXT INPUT (WORKERS & TARGET) ---
+@safe_user_route
+async def boost_got_workers(update, ctx):
+    uid = update.effective_user.id
+    max_w = PLAN_WORKERS.get(get_user_plan(uid)["plan"], 50)
+    text = update.message.text.strip()
+    if not text.isdigit() or not (1 <= int(text) <= max_w):
+        await update.message.reply_text(f"❌ Please send a number between 1 and {max_w}:", reply_markup=workers_select_kb(max_w), parse_mode=ParseMode.HTML)
+        return ASK_WORKERS
+    
+    ctx.user_data["boost"]["workers"] = int(text)
+    status = can_user_boost(uid)
+    max_allowed = min(count_devices(uid), status["remaining"]) if status["limit"] < 999999 else count_devices(uid)
+    
+    await update.message.reply_text(f"🎯 <b>FINAL STEP — TARGET COUNT</b>\nAvailable Devices: {count_devices(uid):,}\nLimit Remaining: {status['remaining'] if status['limit'] < 999999 else '∞'}", reply_markup=target_count_kb(max_allowed), parse_mode=ParseMode.HTML)
+    return ASK_TARGET
+
 @safe_user_route
 async def cb_set_workers_btn(update, ctx):
     q, uid = update.callback_query, update.effective_user.id
@@ -1207,6 +1220,31 @@ async def cb_set_workers_btn(update, ctx):
     max_allowed = min(count_devices(uid), status["remaining"]) if status["limit"] < 999999 else count_devices(uid)
     await q.edit_message_text(f"🎯 <b>FINAL STEP — TARGET COUNT</b>\nAvailable Devices: {count_devices(uid):,}\nLimit Remaining: {status['remaining'] if status['limit'] < 999999 else '∞'}", reply_markup=target_count_kb(max_allowed), parse_mode=ParseMode.HTML)
     return ASK_TARGET
+
+@safe_user_route
+async def boost_got_target(update, ctx):
+    uid = update.effective_user.id
+    text = update.message.text.strip().lower()
+    status = can_user_boost(uid)
+    max_allowed = min(count_devices(uid), status["remaining"]) if status["limit"] < 999999 else count_devices(uid)
+
+    if text == "max": target_success = max_allowed
+    elif text.isdigit(): target_success = min(int(text), max_allowed)
+    else:
+        await update.message.reply_text("❌ Please send a number or tap a button:", reply_markup=target_count_kb(max_allowed))
+        return ASK_TARGET
+
+    if target_success < 1:
+        await update.message.reply_text("❌ Target must be at least 1.", reply_markup=target_count_kb(max_allowed))
+        return ASK_TARGET
+
+    ctx.user_data["boost"]["target_success"] = target_success
+    b = ctx.user_data["boost"]
+    
+    await update.message.reply_text(
+        f"📋 <b>CONFIRM BOOST (ZERO-FAIL READY)</b>\n\n🎯 Target ID: <code>{b['role_id']}</code>\n🌍 Zone ID: <code>{b['zone_id']}</code>\n⚡ Features: <b>{', '.join(FEATURE_LABELS[f] for f in b['features'])}</b>\n🔧 Workers: <b>{b['workers']}</b>\n🎯 Target Success: <b>{b['target_success']:,}</b>",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🚀 LAUNCH BOOST NOW", callback_data="boost_launch")], [InlineKeyboardButton("❌ Cancel", callback_data="main_menu")]]), parse_mode=ParseMode.HTML)
+    return ConversationHandler.END
 
 @safe_user_route
 async def cb_set_target_btn(update, ctx):
@@ -1408,7 +1446,7 @@ def main():
             ASK_FEATURES: [CallbackQueryHandler(cb_feature_select, pattern="^feat_"), CallbackQueryHandler(cb_feat_done, pattern="^feat_done$")],
             ASK_COMMENTS: [CallbackQueryHandler(cb_skip_comments_btn, pattern="^skip_comments_btn$"), MessageHandler(filters.TEXT & ~filters.COMMAND, boost_got_comments)],
             ASK_WORKERS: [CallbackQueryHandler(cb_set_workers_btn, pattern="^setwork_"), MessageHandler(filters.TEXT & ~filters.COMMAND, boost_got_workers)],
-            ASK_TARGET: [CallbackQueryHandler(cb_set_target_btn, pattern="^set4targ_")]
+            ASK_TARGET: [CallbackQueryHandler(cb_set_target_btn, pattern="^set4targ_"), MessageHandler(filters.TEXT & ~filters.COMMAND, boost_got_target)]
         },
         fallbacks=[CommandHandler("start", cmd_start), CallbackQueryHandler(cb_main_menu, pattern="^main_menu$")], allow_reentry=True
     )
