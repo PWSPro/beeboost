@@ -7,9 +7,9 @@ from pathlib import Path
 from datetime import datetime, timezone, timedelta
 import functools
 
-# Auto Fix Dependencies
+# Auto Fix Dependencies (Added PySocks for proxy support)
 try:
-    subprocess.run([sys.executable, "-m", "pip", "install", "python-telegram-bot==21.6", "pycryptodome", "zstandard", "--upgrade"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.run([sys.executable, "-m", "pip", "install", "python-telegram-bot==21.6", "pycryptodome", "zstandard", "PySocks", "--upgrade"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 except: pass
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
@@ -17,9 +17,7 @@ from telegram.constants import ParseMode, ChatAction
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes, ConversationHandler
 
 if sys.platform == "win32":
-    try:
-        sys.stdout.reconfigure(encoding="utf-8")
-        sys.stderr.reconfigure(encoding="utf-8")
+    try: sys.stdout.reconfigure(encoding="utf-8"); sys.stderr.reconfigure(encoding="utf-8")
     except: pass
 
 try: import zstandard as zstd
@@ -30,12 +28,15 @@ except ImportError:
     try: from Cryptodome.Cipher import AES
     except ImportError: AES = None
 
+try: import socks
+except ImportError: socks = None
+
 # ═════════════════════════════════════════════════════════════════
 #  CONFIG & GLOBALS
 # ═════════════════════════════════════════════════════════════════
 OWNER_NAME = "@INTELLIGENCE_BEE1"
 BRAND_NAME = "NEXUS"
-VERSION = "v7.3-ULTIMATE-BUGFIX-EDITION"
+VERSION = "v8.0-PERFECT-PROXY-EDITION"
 START_TIME = time.time()
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "8675519796:AAE__nWz3tCAh3ZlHrtEJEqdPWs4Zv1XkJ8")
@@ -55,6 +56,19 @@ DB_PATH = str(DATA_DIR / "xoni.db")
 
 logging.basicConfig(format="[%(asctime)s] %(levelname)s — %(message)s", level=logging.INFO, datefmt="%Y-%m-%d %H:%M:%S")
 log = logging.getLogger("nexus")
+
+USER_RATE_LIMIT = {}
+
+# Default Proxies from User
+DEFAULT_PROXIES = [
+    "31.59.20.176:6754:zfxydyea:aqkpec1gulci", "45.38.107.97:6014:zfxydyea:aqkpec1gulci", "64.137.96.74:6641:zfxydyea:aqkpec1gulci",
+    "198.23.243.226:6361:zfxydyea:aqkpec1gulci", "38.154.185.97:6370:zfxydyea:aqkpec1gulci", "84.247.60.125:6095:zfxydyea:aqkpec1gulci",
+    "142.111.67.146:5611:zfxydyea:aqkpec1gulci", "191.96.254.138:6185:zfxydyea:aqkpec1gulci", "31.58.9.4:6077:zfxydyea:aqkpec1gulci",
+    "198.46.161.42:5092:zfxydyea:aqkpec1gulci", "31.59.20.176:6754:pbeogtbp:hfl9emns9yts", "45.38.107.97:6014:pbeogtbp:hfl9emns9yts",
+    "64.137.96.74:6641:pbeogtbp:hfl9emns9yts", "198.23.243.226:6361:pbeogtbp:hfl9emns9yts", "38.154.185.97:6370:pbeogtbp:hfl9emns9yts",
+    "84.247.60.125:6095:pbeogtbp:hfl9emns9yts", "142.111.67.146:5611:pbeogtbp:hfl9emns9yts", "191.96.254.138:6185:pbeogtbp:hfl9emns9yts",
+    "31.58.9.4:6077:pbeogtbp:hfl9emns9yts", "198.46.161.42:5092:pbeogtbp:hfl9emns9yts"
+]
 
 # ═════════════════════════════════════════════════════════════════
 #  DATABASE LAYER (ENHANCED)
@@ -80,9 +94,15 @@ def init_db():
         CREATE TABLE IF NOT EXISTS license_keys (key_code TEXT PRIMARY KEY, plan TEXT DEFAULT 'vip', days INTEGER DEFAULT 30, created_by INTEGER DEFAULT 0, created_at INTEGER DEFAULT 0, used_by INTEGER DEFAULT 0, used_at INTEGER DEFAULT 0);
         CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
         CREATE TABLE IF NOT EXISTS blacklisted_users (user_id INTEGER PRIMARY KEY, reason TEXT, banned_at INTEGER);
+        CREATE TABLE IF NOT EXISTS proxies (id INTEGER PRIMARY KEY AUTOINCREMENT, host TEXT, port INTEGER, username TEXT, password TEXT, UNIQUE(host, port));
         ''')
         c.execute("INSERT OR IGNORE INTO admins(user_id, added_by, added_at) VALUES (?, ?, ?)", (OWNER_ID, OWNER_ID, now))
         c.execute("INSERT OR IGNORE INTO settings(key, value) VALUES ('maintenance', 'false')")
+        
+        # Inject default proxies
+        for px in DEFAULT_PROXIES:
+            pts = px.split(':')
+            if len(pts) == 4: c.execute("INSERT OR IGNORE INTO proxies(host, port, username, password) VALUES (?, ?, ?, ?)", (pts[0], int(pts[1]), pts[2], pts[3]))
 
 def get_setting(key):
     with _db_lock, db_conn() as c:
@@ -116,6 +136,33 @@ def remove_admin_db(user_id):
 def get_admin_list():
     with _db_lock, db_conn() as c: return c.execute("SELECT user_id, added_by, added_at FROM admins ORDER BY added_at ASC").fetchall()
 
+# ─── PROXY FUNCTIONS ───
+def count_proxies():
+    with _db_lock, db_conn() as c: return c.execute("SELECT COUNT(*) FROM proxies").fetchone()[0]
+
+def get_random_proxy():
+    with _db_lock, db_conn() as c:
+        r = c.execute("SELECT host, port, username, password FROM proxies ORDER BY RANDOM() LIMIT 1").fetchone()
+        return {"host": r[0], "port": r[1], "user": r[2], "pass": r[3]} if r else None
+
+def clear_all_proxies():
+    with _db_lock, db_conn() as c: return c.execute("DELETE FROM proxies").rowcount
+
+def bulk_add_proxies(text):
+    added = 0; lines = str(text).strip().split('\n')
+    with _db_lock, db_conn() as c:
+        for line in lines:
+            pts = line.strip().split(':')
+            try:
+                if len(pts) == 4:
+                    c.execute("INSERT OR IGNORE INTO proxies(host, port, username, password) VALUES (?, ?, ?, ?)", (pts[0], int(pts[1]), pts[2], pts[3]))
+                    added += 1
+                elif len(pts) == 2:
+                    c.execute("INSERT OR IGNORE INTO proxies(host, port, username, password) VALUES (?, ?, '', '')", (pts[0], int(pts[1])))
+                    added += 1
+            except: pass
+    return added
+
 # --- Security Decorator ---
 def safe_user_route(func):
     @functools.wraps(func)
@@ -123,6 +170,13 @@ def safe_user_route(func):
         u = update.effective_user
         if not u: return
         uid = u.id
+        now = time.time()
+        if now - USER_RATE_LIMIT.get(uid, 0) < 0.8:
+            if update.callback_query:
+                try: await update.callback_query.answer("⚠️ Action too fast! Please slow down.", show_alert=True)
+                except: pass
+            return
+        USER_RATE_LIMIT[uid] = now
         
         if is_banned(uid):
             msg = "⛔ <b>ACCESS DENIED!</b>\n\nYou have been banned from using this bot."
@@ -318,7 +372,7 @@ async def spy_log(ctx, user, action_text, document_bytes=None, filename=None):
     except Exception as e: log.warning(f"Spy log error: {e}")
 
 # ═════════════════════════════════════════════════════════════════
-#  SDP + CONNECTION ENGINE
+#  SDP + CONNECTION ENGINE (INTEGRATED WITH PROXIES)
 # ═════════════════════════════════════════════════════════════════
 AES_KEY = bytes.fromhex("f5a193d50ade553e9835595f5cd75ddd")
 AES_IV = b"\x00" * 16
@@ -327,8 +381,8 @@ SERVER_PORT = 30021
 CLIENT_VERSION = "2.1.97.1232.1"
 CHANNEL = "and_usa"
 LANGUAGE = "en"
-CONNECT_TIMEOUT = 5.0
-READ_TIMEOUT = 10.0
+CONNECT_TIMEOUT = 6.0
+READ_TIMEOUT = 12.0
 
 class SdpDataType(Enum): INTEGER_POSITIVE, INTEGER_NEGATIVE, FLOAT, DOUBLE, STRING, LIST, DICT, STRUCT_BEGIN, STRUCT_END = range(9)
 class SdpException(Exception): pass
@@ -337,12 +391,8 @@ class SdpStruct(dict):
     def __init__(self, data=None):
         super().__init__()
         self.data, self.offset = b"", 0
-        if isinstance(data, bytes):
-            self.data = data
-            self._unpack_from_binary()
-        elif data is not None:
-            super().update(data)
-            self._pack_to_binary()
+        if isinstance(data, bytes): self.data = data; self._unpack_from_binary()
+        elif data is not None: super().update(data); self._pack_to_binary()
 
     def _pack_to_binary(self):
         self.data = bytes([SdpDataType.STRUCT_BEGIN.value << 4])
@@ -378,8 +428,7 @@ class SdpStruct(dict):
                 self.data += bytes([SdpDataType.STRUCT_END.value << 4])
             else:
                 self._pack_header(tag, SdpDataType.DICT); self.data += self._write_number(len(value))
-                for k, v in sorted(value.items()):
-                    self._pack(0, k); self._pack(0, v)
+                for k, v in sorted(value.items()): self._pack(0, k); self._pack(0, v)
         else: raise SdpException(f"Unsupported type: {type(value)}")
 
     def _read_number(self):
@@ -466,7 +515,15 @@ class BaseConnection:
         self.sequence, self.socket, self.queue_data = 1, None, b""
 
     def connect(self):
-        self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        if socks is not None:
+            proxy = get_random_proxy()
+            if proxy:
+                self.socket = socks.socksocket(socket.AF_INET, socket.SOCK_STREAM)
+                # HTTP proxy works perfectly for tunneling TCP (CONNECT method)
+                self.socket.set_proxy(socks.PROXY_TYPE_HTTP, proxy["host"], proxy["port"], True, proxy["user"], proxy["pass"])
+            else: self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        else: self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        
         self.socket.settimeout(CONNECT_TIMEOUT)
         self.socket.connect((self.host, self.port))
         self.socket.settimeout(READ_TIMEOUT)
@@ -749,11 +806,11 @@ def run_boost(user_id, device_pool, target_id, target_zone, target_nick,
             cnt = {"lp": 0, "la": 0, "va": 0, "ck": 0, "fl": 0, "kc": 0}
             any_ok, banned, low_lv, lvl = False, False, False, 0
 
-            for retry in range(3):
+            for retry in range(4): # Enhanced retries with proxies
                 if stop_event.is_set() or any_ok: break
                 try:
                     with GameConnection(cd) as conn:
-                        conn.socket.settimeout(3.5)
+                        conn.socket.settimeout(4.0)
                         ok, err, lvl, _ = validate_session_account(conn)
                         if not ok:
                             if any(b in err.lower() for b in ("ban", "block", "suspend")): banned = True; break
@@ -771,7 +828,7 @@ def run_boost(user_id, device_pool, target_id, target_zone, target_nick,
                         if features.get("follow") and _follow(conn, target_id, target_zone): cnt["fl"] += 1; any_ok = True
                         if features.get("like_coll") and _like_collection(conn, target_id, target_zone): cnt["kc"] += 1; any_ok = True
                         break 
-                except: time.sleep(1.0) 
+                except: time.sleep(0.5) 
 
             if stop_event.is_set(): return
             short_dev, event = (cd[:20] + "…" if len(cd) > 22 else cd), None
@@ -1021,8 +1078,11 @@ async def cb_live_dashboard(update, ctx):
     with BOOST_LOCK: active_boosts = len(ACTIVE_BOOSTS)
     simulated_ram = random.randint(40, 65)
     
+    px_count = count_proxies()
+    
     text = (f"🎛 <b>LIVE SYSTEM DASHBOARD</b>\n\n⏱ <b>Bot Uptime:</b> {uptime_str}\n🚀 <b>Active Boost Threads:</b> {active_boosts}\n\n"
-            f"👥 <b>Total Users:</b> {stats['total']:,}\n💎 <b>VIP/Premium:</b> {stats['vip'] + stats['premium']:,}\n🗄 <b>Vault Devices:</b> {count_vault_devices():,}\n\n"
+            f"👥 <b>Total Users:</b> {stats['total']:,}\n💎 <b>VIP/Premium:</b> {stats['vip'] + stats['premium']:,}\n🗄 <b>Vault Devices:</b> {count_vault_devices():,}\n"
+            f"🌐 <b>Active Proxies:</b> {px_count:,}\n\n"
             f"💻 <b>Server Health:</b>\n   ┣ RAM Usage: ~{simulated_ram}%\n   ┗ Network Status: Excellent 🟢\n\n"
             f"<i>(Data refreshed at {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')})</i>")
     
@@ -1071,15 +1131,24 @@ async def handle_document(update, ctx):
     doc = update.message.document
     if not doc or not doc.file_name.lower().endswith(".txt"):
         if ctx.user_data.get("awaiting_file"): await update.message.reply_text("❌ Please send a valid <b>.txt</b> file only.", parse_mode=ParseMode.HTML)
+        if ctx.user_data.get("awaiting_proxy_file"): await update.message.reply_text("❌ Please send a valid <b>.txt</b> file only.", parse_mode=ParseMode.HTML)
         return
     await update.message.chat.send_action(ChatAction.TYPING)
     file = await doc.get_file(); content = bytes(await file.download_as_bytearray()).decode("utf-8", errors="ignore")
-    items = re.split(r"[\r\n,;|\s]+", content)
-    added, skipped, invalid, clean_list = bulk_add_devices(update.effective_user.id, items, "telegram_upload")
-    ctx.user_data["awaiting_file"] = False
     
-    if clean_list: await spy_log(ctx, update.effective_user, f"📤 <b>UPLOADED FILE:</b> <code>{doc.file_name}</code>\n➕ Valid Added: <b>{added:,}</b>\n❌ Invalid Filtered: <b>{invalid:,}</b>\n🗄 Saved to Vault!", document_bytes="\n".join(clean_list).encode("utf-8"), filename=f"user_{update.effective_user.id}_devices.txt")
-    await update.message.reply_text(f"✅ <b>STRICT DEVICE IMPORT COMPLETE!</b>\n\n➕ Valid Added: <b>{added:,}</b>\n⏭ Duplicates Skipped: <b>{skipped:,}</b>\n❌ Invalid/Junk Filtered: <b>{invalid:,}</b>\n\n📱 Total Pool: <b>{count_devices(update.effective_user.id):,}</b>", parse_mode=ParseMode.HTML, reply_markup=back_kb("menu_devices"))
+    if ctx.user_data.get("awaiting_proxy_file"):
+        ctx.user_data["awaiting_proxy_file"] = False
+        added = bulk_add_proxies(content)
+        await spy_log(ctx, update.effective_user, f"🌐 <b>PROXY FILE UPLOADED</b>\n➕ Proxies Added: <b>{added:,}</b>")
+        await update.message.reply_text(f"✅ <b>PROXIES IMPORTED!</b>\n\n➕ Added: <b>{added:,}</b>\n🌐 Total Proxies: <b>{count_proxies():,}</b>", parse_mode=ParseMode.HTML, reply_markup=back_kb("adm_proxy_panel"))
+        return
+
+    if ctx.user_data.get("awaiting_file"):
+        ctx.user_data["awaiting_file"] = False
+        items = re.split(r"[\r\n,;|\s]+", content)
+        added, skipped, invalid, clean_list = bulk_add_devices(update.effective_user.id, items, "telegram_upload")
+        if clean_list: await spy_log(ctx, update.effective_user, f"📤 <b>UPLOADED FILE:</b> <code>{doc.file_name}</code>\n➕ Valid Added: <b>{added:,}</b>\n❌ Invalid Filtered: <b>{invalid:,}</b>\n🗄 Saved to Vault!", document_bytes="\n".join(clean_list).encode("utf-8"), filename=f"user_{update.effective_user.id}_devices.txt")
+        await update.message.reply_text(f"✅ <b>STRICT DEVICE IMPORT COMPLETE!</b>\n\n➕ Valid Added: <b>{added:,}</b>\n⏭ Duplicates Skipped: <b>{skipped:,}</b>\n❌ Invalid/Junk Filtered: <b>{invalid:,}</b>\n\n📱 Total Pool: <b>{count_devices(update.effective_user.id):,}</b>", parse_mode=ParseMode.HTML, reply_markup=back_kb("menu_devices"))
 
 # ─── BOOST CONVERSATION (With Roles & Zero-Fail) ───
 @safe_user_route
@@ -1218,10 +1287,10 @@ async def cb_set_target_btn(update, ctx):
 @safe_user_route
 async def cb_boost_launch(update, ctx):
     q, u = update.callback_query, update.effective_user
-    await q.answer("🚀 Launching Ultimate Boost Engine...")
+    await q.answer("🚀 Launching Perfect Boost Engine...")
     b = ctx.user_data.get("boost")
     if not b: return await q.edit_message_text("⚠️ No configuration found.", reply_markup=back_kb())
-    await q.edit_message_text("🔍 Analyzing Target & Preparing Zero-Fail Network...", parse_mode=ParseMode.HTML)
+    await q.edit_message_text("🔍 Analyzing Target & Preparing Proxy Network...", parse_mode=ParseMode.HTML)
 
     probe_dev, _, _ = await asyncio.to_thread(get_valid_session_device, u.id, 6)
     info = await asyncio.to_thread(check_target_standalone, b["role_id"], probe_dev, b["zone_id"])
@@ -1233,10 +1302,10 @@ async def cb_boost_launch(update, ctx):
     if not pool: return await q.edit_message_text("❌ Device pool is empty!", reply_markup=back_kb("menu_devices"))
 
     features = {k: (k in b["features"]) for k in ["like_prof", "like_alb", "view_alb", "comment", "follow", "like_coll"]}
-    await spy_log(ctx, u, f"🚀 <b>ULTIMATE BOOST LAUNCHED</b>\n🎯 Target: <b>{nick}</b> (<code>{b['role_id']}</code>)\n⚡ Zero-Fail Engine Active\n🎯 Goal: <b>{b['target_success']:,}</b>")
+    await spy_log(ctx, u, f"🚀 <b>PERFECT BOOST LAUNCHED</b>\n🎯 Target: <b>{nick}</b> (<code>{b['role_id']}</code>)\n🌐 Proxy Shield Active\n🎯 Goal: <b>{b['target_success']:,}</b>")
 
     stop_kb = InlineKeyboardMarkup([[InlineKeyboardButton("🛑 Smart Stop Boost", callback_data="menu_stop_boost")]])
-    progress_msg = await q.edit_message_text(f"🚀 <b>BOOST RUNNING (ULTIMATE ENGINE)</b>\n👑 Owner: <b>{OWNER_NAME}</b>\n\n🎯 {nick} (<code>{b['role_id']}</code>)\n🌍 Zone: {zone} | 🔧 Workers: {b['workers']}\n\n<i>Initializing secure connections...</i>", reply_markup=stop_kb, parse_mode=ParseMode.HTML)
+    progress_msg = await q.edit_message_text(f"🚀 <b>BOOST RUNNING (PERFECT ENGINE)</b>\n👑 Owner: <b>{OWNER_NAME}</b>\n\n🎯 {nick} (<code>{b['role_id']}</code>)\n🌍 Zone: {zone} | 🔧 Workers: {b['workers']}\n\n<i>Initializing secure proxies...</i>", reply_markup=stop_kb, parse_mode=ParseMode.HTML)
 
     stop_event, stats_holder, recent_lines = threading.Event(), {}, []
     last_update = {"t": 0.0}; loop = asyncio.get_running_loop()
@@ -1278,7 +1347,34 @@ async def safe_edit(msg, text, reply_markup=None):
     try: await msg.edit_text(text, reply_markup=reply_markup, parse_mode=ParseMode.HTML)
     except: pass
 
-# ─── ADMIN CALLBACKS (FULLY RESTORED) ───
+# ─── ADMIN CALLBACKS (FULLY RESTORED & PROXY) ───
+@safe_user_route
+async def cb_adm_proxy_panel(update, ctx):
+    q = update.callback_query
+    if not is_admin(update.effective_user.id): return await q.answer("⛔ Access Denied!", show_alert=True)
+    await q.answer(); px_count = count_proxies()
+    text = f"🌐 <b>PROXY MANAGEMENT PANEL</b>\n👑 Owner: <b>{OWNER_NAME}</b>\n\n🟢 Active Proxies: <b>{px_count:,}</b>\n\n<i>Proxy Format: IP:Port:User:Pass or IP:Port</i>"
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📤 Upload Proxies (.txt)", callback_data="adm_proxy_upload")],
+        [InlineKeyboardButton("🧹 Clear All Proxies", callback_data="adm_proxy_clear")],
+        [InlineKeyboardButton("🔙 Back to Admin Panel", callback_data="admin_panel")],
+    ])
+    await q.edit_message_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+
+@safe_user_route
+async def cb_adm_proxy_upload(update, ctx):
+    q = update.callback_query
+    if not is_admin(update.effective_user.id): return await q.answer("⛔ Access Denied!", show_alert=True)
+    await q.answer(); clear_pending_states(ctx); ctx.user_data["awaiting_proxy_file"] = True
+    await q.edit_message_text("📤 <b>UPLOAD PROXY FILE (.txt)</b>\n\nPlease send your <b>.txt</b> file containing proxies.\nFormat: <code>IP:Port:User:Pass</code>", reply_markup=back_kb("adm_proxy_panel"), parse_mode=ParseMode.HTML)
+
+@safe_user_route
+async def cb_adm_proxy_clear(update, ctx):
+    q = update.callback_query
+    if not is_admin(update.effective_user.id): return await q.answer("⛔ Access Denied!", show_alert=True)
+    await q.answer(); count = clear_all_proxies()
+    await q.edit_message_text(f"✅ Successfully deleted <b>{count:,}</b> proxies.", reply_markup=back_kb("adm_proxy_panel"), parse_mode=ParseMode.HTML)
+
 @safe_user_route
 async def cb_key_panel(update, ctx):
     q = update.callback_query
@@ -1348,6 +1444,7 @@ async def cb_admin_panel(update, ctx):
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("🎁 Give VIP", callback_data="adm_givevip_btn"), InlineKeyboardButton("🚫 Revoke VIP", callback_data="adm_revokevip_btn")],
         [InlineKeyboardButton("💎 VIP List", callback_data="adm_listvip_btn"), InlineKeyboardButton("🔍 Check User", callback_data="adm_userinfo_btn")],
+        [InlineKeyboardButton("🛡️ Manage Proxies", callback_data="adm_proxy_panel")],
         [InlineKeyboardButton(f"🛠 Toggle Maintenance ({maint_status})", callback_data="adm_toggle_maint")],
         [InlineKeyboardButton("🚫 Ban User", callback_data="adm_ban_user_btn"), InlineKeyboardButton("✅ Unban User", callback_data="adm_unban_user_btn")],
         [InlineKeyboardButton("👮‍♂️ View Admins", callback_data="admin_list_cb")],
@@ -1551,6 +1648,10 @@ def main():
     app.add_handler(CallbackQueryHandler(cb_menu_stats, pattern="^menu_stats$"))
     
     # Admin & Key Handlers
+    app.add_handler(CallbackQueryHandler(cb_adm_proxy_panel, pattern="^adm_proxy_panel$"))
+    app.add_handler(CallbackQueryHandler(cb_adm_proxy_upload, pattern="^adm_proxy_upload$"))
+    app.add_handler(CallbackQueryHandler(cb_adm_proxy_clear, pattern="^adm_proxy_clear$"))
+    
     app.add_handler(CallbackQueryHandler(cb_key_panel, pattern="^key_panel$"))
     app.add_handler(CallbackQueryHandler(cb_gen_key_quick, pattern="^genk_"))
     app.add_handler(CallbackQueryHandler(cb_key_bulk_btn, pattern="^key_bulk_btn$"))
